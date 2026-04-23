@@ -1,6 +1,7 @@
 import cocotb
 from cocotb.clock import Clock
 from cocotb.triggers import ClockCycles
+from cocotb.triggers import ReadOnly
 
 OP_ADD = 0b000
 OP_REVERSE = 0b111
@@ -24,14 +25,17 @@ async def test_rqpu_basic(dut):
     # load accumulator with 0x6
     dut.ui_in.value = pack_ui(0, 0x6, 0)
     await ClockCycles(dut.clk, 1)
+    await ReadOnly()
     assert (int(dut.uo_out.value) & 0xF) == 0x6
 
     # add 0x3 -> expect 0x9
     dut.ui_in.value = pack_ui(1, 0x3, OP_ADD)
     await ClockCycles(dut.clk, 1)
+    await ReadOnly()
     assert (int(dut.uo_out.value) & 0xF) == 0x9
 
     # reverse -> expect back to 0x6
     dut.ui_in.value = pack_ui(1, 0x0, OP_REVERSE)
     await ClockCycles(dut.clk, 1)
+    await ReadOnly()
     assert (int(dut.uo_out.value) & 0xF) == 0x6
