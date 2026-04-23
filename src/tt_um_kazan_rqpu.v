@@ -3,7 +3,7 @@
  *
  * NOTE:
  * - The top module name is `tt_um_kazan_rqpu`.
- * - This combined file includes all submodules: primitives, operators, core.
+ * - This combined file includes all submodules: primitives, operators, core. Has everything together
  * SPDX-License-Identifier: Apache-2.0
  */
 `default_nettype none
