@@ -9,12 +9,12 @@ You can also include images in this folder and reference them in the markdown. E
 
 ## How it works
 
-Explain how your project works
+The architecture uses Toffoli gates for the arithmetic and logic unit (ADD, AND, NAND via ancilla bits), Fredkin gates for the routing and shifting modes (SWAP, SHIFT, MUX), and a CNOT chain for XOR and parity. The 3-bit opcode decoder selects among 8 modes. The clock drives a 4-bit accumulator register so the chip acts statefully — load an operand, clock in an operation, read the result, then chain further operations.
 
 ## How to test
 
-Explain how to use your project
+I/O mapping is tight: 3 bits of opcode, 4 bits of operand, and 1 load/execute control all fit in ui_in[7:0]. The 8 output bits carry the 4-bit result, 2 status flags (zero and carry), and 2 garbage output bits that are intentionally exposed to demonstrate reversibility 
 
 ## External hardware
 
-List external hardware used in your project (e.g. PMOD, LED display, etc), if any
+No External HW, maybe a MCU or FPGA for monitaroing 
