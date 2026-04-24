@@ -1,7 +1,7 @@
 /*
  * SPDX-License-Identifier: Apache-2.0
  *
- * RQPU v2: Reversible-computing-inspired 4-bit processor for Tiny Tapeout.
+ * RQPU v2-fit: area-reduced reversible-computing-inspired 4-bit core for Tiny Tapeout.
  *
  * Public bus contract:
  *   uo_out[7:6] = phase[1:0]
@@ -9,33 +9,32 @@
  *   uo_out[1]   = Z flag
  *   uo_out[0]   = C flag
  *
- * Input protocol:
- *   Phase 00: ui_in[7:5] = class, ui_in[4] = mode, ui_in[3:0] = func
- *   Phase 01: ui_in[7:4] = A,     ui_in[3:0] = B
- *   Phase 10: internal execute / commit preparation
- *   Phase 11: outputs valid
+ * Phase protocol:
+ *   P0 (00): latch instruction      ui_in[7:5]=class, ui_in[4]=mode, ui_in[3:0]=func
+ *   P1 (01): latch operand/data     ui_in[7:4]=A,     ui_in[3:0]=B
+ *   P2 (10): execute / commit state
+ *   P3 (11): outputs valid
  *
- * Architectural highlights:
- * - 4-phase deterministic controller protocol
- * - 4x4 scratchpad RAM implemented with registers
- * - Memory-mapped internal registers
- * - Minimal metadata REVERSE operation for single-step undo
- * - uio_* intentionally unused
+ * Area-reduced architectural state:
+ *   - ACC, SHD, OUT, Z, C
+ *   - 4x4 scratchpad RAM
+ *   - single-step checkpoint / undo
+ *   - no uio usage
  */
 `default_nettype none
 
 module tt_um_kazan_rqpu (
-    input  wire [7:0] ui_in,    // Dedicated inputs
-    output wire [7:0] uo_out,   // Dedicated outputs
-    input  wire [7:0] uio_in,   // IOs: Input path (unused)
-    output wire [7:0] uio_out,  // IOs: Output path (unused)
-    output wire [7:0] uio_oe,   // IOs: Enable path (unused)
-    input  wire       ena,      // Design enable
-    input  wire       clk,      // Clock
-    input  wire       rst_n     // Active-low reset
+    input  wire [7:0] ui_in,
+    output wire [7:0] uo_out,
+    input  wire [7:0] uio_in,
+    output wire [7:0] uio_out,
+    output wire [7:0] uio_oe,
+    input  wire       ena,
+    input  wire       clk,
+    input  wire       rst_n
 );
     // ---------------------------------------------------------------------
-    // Phase encoding
+    // Phases
     // ---------------------------------------------------------------------
     localparam [1:0] P0_INSTR   = 2'b00;
     localparam [1:0] P1_OPERAND = 2'b01;
@@ -43,36 +42,22 @@ module tt_um_kazan_rqpu (
     localparam [1:0] P3_OUTPUT  = 2'b11;
 
     // ---------------------------------------------------------------------
-    // Instruction families
+    // Reduced class map (v2-fit)
     // ---------------------------------------------------------------------
-    localparam [2:0] CLS_ARITH = 3'b000;
-    localparam [2:0] CLS_LOGIC = 3'b001;
-    localparam [2:0] CLS_SHIFT = 3'b010;
-    localparam [2:0] CLS_CMP   = 3'b011;
-    localparam [2:0] CLS_MEM   = 3'b100;
-    localparam [2:0] CLS_SYS   = 3'b101;
-    localparam [2:0] CLS_REV   = 3'b110;
-    localparam [2:0] CLS_CTRL  = 3'b111;
+    localparam [2:0] CLS_ALU   = 3'b000; // ADD/XOR/AND/OR
+    localparam [2:0] CLS_PERM  = 3'b001; // ROL/ROR/SWAP2/BITREV
+    localparam [2:0] CLS_MEM   = 3'b010; // READ/WRITE/LOADACC/SWAPACC
+    localparam [2:0] CLS_REV   = 3'b011; // SAVE/REVERSE/ACC<->SHD/PARITY
+    localparam [2:0] CLS_CTRL  = 3'b100; // SETACC/SETSHD/CMP/CLEAR
+    // 101/110/111 reserved as NOPs
 
     // ---------------------------------------------------------------------
-    // System-register map (mode = 1)
+    // 2-bit system-space map (mode = 1)
     // ---------------------------------------------------------------------
-    localparam [3:0] SYS_ACC   = 4'h0;
-    localparam [3:0] SYS_BREG  = 4'h1;
-    localparam [3:0] SYS_SHD   = 4'h2;
-    localparam [3:0] SYS_FLAGS = 4'h3; // {UNDO_VALID, N, C, Z}
-    localparam [3:0] SYS_PACC  = 4'h4;
-    localparam [3:0] SYS_PB    = 4'h5;
-    localparam [3:0] SYS_PSHD  = 4'h6;
-    localparam [3:0] SYS_PFLG  = 4'h7;
-    localparam [3:0] SYS_MAR   = 4'h8;
-    localparam [3:0] SYS_MDR   = 4'h9;
-    localparam [3:0] SYS_OUT   = 4'hA;
-    localparam [3:0] SYS_PHS   = 4'hB;
-    localparam [3:0] SYS_TMP0  = 4'hC;
-    localparam [3:0] SYS_TMP1  = 4'hD;
-    localparam [3:0] SYS_EXT0  = 4'hE;
-    localparam [3:0] SYS_EXT1  = 4'hF;
+    localparam [1:0] SYS_ACC   = 2'b00;
+    localparam [1:0] SYS_SHD   = 2'b01;
+    localparam [1:0] SYS_FLAGS = 2'b10; // {2'b00, Z, C}
+    localparam [1:0] SYS_OUT   = 2'b11;
 
     // ---------------------------------------------------------------------
     // Architectural state
@@ -86,50 +71,30 @@ module tt_um_kazan_rqpu (
     reg [3:0] arg_b_q;
 
     reg [3:0] acc_q;
-    reg [3:0] breg_q;
     reg [3:0] shd_q;
-    reg [2:0] flags_q;      // {N, C, Z}
-    reg       undo_valid_q; // mirrored into FLAGS[3]
-    reg [3:0] mar_q;
-    reg [3:0] mdr_q;
     reg [3:0] out_q;
-    reg [3:0] tmp0_q;
-    reg [3:0] tmp1_q;
-    reg [3:0] ext0_q;
-    reg [3:0] ext1_q;
+    reg       z_q;
+    reg       c_q;
+
     reg [3:0] ram_q [0:3];
 
+    // Undo / checkpoint state
     reg [3:0] prev_acc_q;
-    reg [3:0] prev_breg_q;
     reg [3:0] prev_shd_q;
-    reg [2:0] prev_flags_q;
     reg [3:0] prev_out_q;
-    reg       undo_has_write_q;
-    reg       undo_write_mode_q; // 0: RAM, 1: SYS
-    reg [3:0] undo_write_addr_q;
-    reg [3:0] undo_write_data_q;
+    reg       prev_z_q;
+    reg       prev_c_q;
+    reg       undo_valid_q;
+    reg       undo_write_valid_q;
+    reg       undo_write_mode_q;    // 0 = RAM, 1 = SYS
+    reg [1:0] undo_write_addr_q;
+    reg [3:0] undo_write_olddata_q;
 
     integer i;
 
     // ---------------------------------------------------------------------
-    // Utility functions
+    // Helpers
     // ---------------------------------------------------------------------
-    function [2:0] flags_from_result;
-        input [3:0] value;
-        input       carry_like;
-        begin
-            flags_from_result = {value[3], carry_like, (value == 4'h0)};
-        end
-    endfunction
-
-    function [3:0] popcount4;
-        input [3:0] value;
-        begin
-            popcount4 = {2'b00, value[0]} + {2'b00, value[1]} +
-                        {2'b00, value[2]} + {2'b00, value[3]};
-        end
-    endfunction
-
     function [3:0] bitrev4;
         input [3:0] value;
         begin
@@ -144,218 +109,138 @@ module tt_um_kazan_rqpu (
         end
     endfunction
 
-    function        is_gp_sys_addr;
-        input [3:0] addr;
+    function [3:0] parity4;
+        input [3:0] value;
         begin
-            case (addr)
-                SYS_ACC,
-                SYS_BREG,
-                SYS_SHD,
-                SYS_MAR,
-                SYS_MDR,
-                SYS_TMP0,
-                SYS_TMP1,
-                SYS_EXT0,
-                SYS_EXT1: is_gp_sys_addr = 1'b1;
-                default:   is_gp_sys_addr = 1'b0;
-            endcase
+            parity4 = {3'b000, ^value};
         end
     endfunction
 
-    function        is_writable_sys_addr;
-        input [3:0] addr;
+    function [3:0] flags_pack;
+        input z_in;
+        input c_in;
         begin
-            case (addr)
-                SYS_ACC,
-                SYS_BREG,
-                SYS_SHD,
-                SYS_FLAGS,
-                SYS_MAR,
-                SYS_MDR,
-                SYS_OUT,
-                SYS_TMP0,
-                SYS_TMP1,
-                SYS_EXT0,
-                SYS_EXT1: is_writable_sys_addr = 1'b1;
-                default:   is_writable_sys_addr = 1'b0;
-            endcase
+            flags_pack = {2'b00, z_in, c_in};
         end
     endfunction
 
     function [3:0] sys_read;
-        input [3:0] addr;
+        input [1:0] addr;
         begin
             case (addr)
                 SYS_ACC:   sys_read = acc_q;
-                SYS_BREG:  sys_read = breg_q;
                 SYS_SHD:   sys_read = shd_q;
-                SYS_FLAGS: sys_read = {undo_valid_q, flags_q};
-                SYS_PACC:  sys_read = prev_acc_q;
-                SYS_PB:    sys_read = prev_breg_q;
-                SYS_PSHD:  sys_read = prev_shd_q;
-                SYS_PFLG:  sys_read = {1'b0, prev_flags_q};
-                SYS_MAR:   sys_read = mar_q;
-                SYS_MDR:   sys_read = mdr_q;
-                SYS_OUT:   sys_read = out_q;
-                SYS_PHS:   sys_read = {phase_q, (phase_q != P0_INSTR), (phase_q == P3_OUTPUT)};
-                SYS_TMP0:  sys_read = tmp0_q;
-                SYS_TMP1:  sys_read = tmp1_q;
-                SYS_EXT0:  sys_read = ext0_q;
-                SYS_EXT1:  sys_read = ext1_q;
-                default:   sys_read = 4'h0;
+                SYS_FLAGS: sys_read = flags_pack(z_q, c_q);
+                default:   sys_read = out_q; // SYS_OUT
             endcase
         end
     endfunction
 
     function [3:0] mapped_read;
         input       mode;
-        input [3:0] addr;
+        input [1:0] addr;
         begin
             if (mode) begin
                 mapped_read = sys_read(addr);
             end else begin
-                mapped_read = ram_q[addr[1:0]];
+                mapped_read = ram_q[addr];
             end
         end
     endfunction
 
-    wire [3:0] src_val_w    = ir_mode_q ? sys_read(arg_a_q) : arg_b_q;
-    wire [3:0] sys_a_val_w  = sys_read(arg_a_q);
-    wire [3:0] sys_b_val_w  = sys_read(arg_b_q);
-
-    // ---------------------------------------------------------------------
-    // Snapshot helpers for REVERSE
-    // ---------------------------------------------------------------------
-    task snapshot_current_to_prev;
+    task checkpoint_no_write;
         begin
-            prev_acc_q   <= acc_q;
-            prev_breg_q  <= breg_q;
-            prev_shd_q   <= shd_q;
-            prev_flags_q <= flags_q;
-            prev_out_q   <= out_q;
-            undo_has_write_q <= 1'b0;
-        end
-    endtask
-
-    task clear_prev_snapshot;
-        begin
-            prev_acc_q   <= 4'h0;
-            prev_breg_q  <= 4'h0;
-            prev_shd_q   <= 4'h0;
-            prev_flags_q <= 3'b000;
-            prev_out_q   <= 4'h0;
-            undo_has_write_q  <= 1'b0;
+            prev_acc_q        <= acc_q;
+            prev_shd_q        <= shd_q;
+            prev_out_q        <= out_q;
+            prev_z_q          <= z_q;
+            prev_c_q          <= c_q;
+            undo_valid_q      <= 1'b1;
+            undo_write_valid_q<= 1'b0;
             undo_write_mode_q <= 1'b0;
-            undo_write_addr_q <= 4'h0;
-            undo_write_data_q <= 4'h0;
+            undo_write_addr_q <= 2'b00;
+            undo_write_olddata_q <= 4'h0;
         end
     endtask
 
-    task swap_current_and_prev;
+    task checkpoint_ram_write;
+        input [1:0] addr;
+        input [3:0] olddata;
         begin
-            acc_q        <= prev_acc_q;
-            breg_q       <= prev_breg_q;
-            shd_q        <= prev_shd_q;
-            flags_q      <= prev_flags_q;
-            out_q        <= prev_out_q;
-
-            if (undo_has_write_q) begin
-                if (!undo_write_mode_q) begin
-                    ram_q[undo_write_addr_q[1:0]] <= undo_write_data_q;
-                end else if (is_writable_sys_addr(undo_write_addr_q)) begin
-                    write_current_sys_reg(undo_write_addr_q, undo_write_data_q);
-                end
-            end
-
-            undo_valid_q <= 1'b0;
-            undo_has_write_q <= 1'b0;
+            prev_acc_q        <= acc_q;
+            prev_shd_q        <= shd_q;
+            prev_out_q        <= out_q;
+            prev_z_q          <= z_q;
+            prev_c_q          <= c_q;
+            undo_valid_q      <= 1'b1;
+            undo_write_valid_q<= 1'b1;
+            undo_write_mode_q <= 1'b0;
+            undo_write_addr_q <= addr;
+            undo_write_olddata_q <= olddata;
         end
     endtask
 
-    task clear_current_state;
-        integer idx;
-        begin
-            acc_q   <= 4'h0;
-            breg_q  <= 4'h0;
-            shd_q   <= 4'h0;
-            flags_q <= 3'b000;
-            mar_q   <= 4'h0;
-            mdr_q   <= 4'h0;
-            out_q   <= 4'h0;
-            tmp0_q  <= 4'h0;
-            tmp1_q  <= 4'h0;
-            ext0_q  <= 4'h0;
-            ext1_q  <= 4'h0;
-            for (idx = 0; idx < 4; idx = idx + 1) begin
-                ram_q[idx] <= 4'h0;
-            end
-        end
-    endtask
-
-    task write_current_sys_reg;
-        input [3:0] addr;
+    task write_sys;
+        input [1:0] addr;
         input [3:0] data;
         begin
             case (addr)
-                SYS_ACC:   acc_q   <= data;
-                SYS_BREG:  breg_q  <= data;
-                SYS_SHD:   shd_q   <= data;
-                SYS_FLAGS: flags_q <= data[2:0];
-                SYS_MAR:   mar_q   <= data;
-                SYS_MDR:   mdr_q   <= data;
-                SYS_OUT:   out_q   <= data;
-                SYS_TMP0:  tmp0_q  <= data;
-                SYS_TMP1:  tmp1_q  <= data;
-                SYS_EXT0:  ext0_q  <= data;
-                SYS_EXT1:  ext1_q  <= data;
-                default: begin end
+                SYS_ACC: begin
+                    acc_q <= data;
+                end
+                SYS_SHD: begin
+                    shd_q <= data;
+                end
+                SYS_FLAGS: begin
+                    z_q <= data[1];
+                    c_q <= data[0];
+                end
+                default: begin
+                    out_q <= data; // SYS_OUT
+                end
             endcase
         end
     endtask
 
     // ---------------------------------------------------------------------
-    // Main phase-driven controller
-    // Commit architectural state in phase 10 so that outputs are valid during
-    // phase 11.
+    // Main controller
+    // State updates happen in P2 so the committed result is visible in P3.
     // ---------------------------------------------------------------------
     always @(posedge clk or negedge rst_n) begin
         reg [4:0] ext5;
         reg [3:0] tmp_data;
-        reg [3:0] tmp_data_b;
+        reg [3:0] old_mapped;
+        reg [1:0] a2;
         if (!rst_n) begin
-            phase_q      <= P0_INSTR;
-            ir_class_q   <= 3'b000;
-            ir_mode_q    <= 1'b0;
-            ir_func_q    <= 4'h0;
-            arg_a_q      <= 4'h0;
-            arg_b_q      <= 4'h0;
+            phase_q <= P0_INSTR;
+            ir_class_q <= 3'b000;
+            ir_mode_q  <= 1'b0;
+            ir_func_q  <= 4'h0;
+            arg_a_q    <= 4'h0;
+            arg_b_q    <= 4'h0;
 
-            acc_q        <= 4'h0;
-            breg_q       <= 4'h0;
-            shd_q        <= 4'h0;
-            flags_q      <= 3'b000;
+            acc_q <= 4'h0;
+            shd_q <= 4'h0;
+            out_q <= 4'h0;
+            z_q   <= 1'b0;
+            c_q   <= 1'b0;
+
+            prev_acc_q <= 4'h0;
+            prev_shd_q <= 4'h0;
+            prev_out_q <= 4'h0;
+            prev_z_q   <= 1'b0;
+            prev_c_q   <= 1'b0;
             undo_valid_q <= 1'b0;
-            mar_q        <= 4'h0;
-            mdr_q        <= 4'h0;
-            out_q        <= 4'h0;
-            tmp0_q       <= 4'h0;
-            tmp1_q       <= 4'h0;
-            ext0_q       <= 4'h0;
-            ext1_q       <= 4'h0;
+            undo_write_valid_q <= 1'b0;
+            undo_write_mode_q  <= 1'b0;
+            undo_write_addr_q  <= 2'b00;
+            undo_write_olddata_q <= 4'h0;
 
-            prev_acc_q   <= 4'h0;
-            prev_breg_q  <= 4'h0;
-            prev_shd_q   <= 4'h0;
-            prev_flags_q <= 3'b000;
-            prev_out_q   <= 4'h0;
-            undo_has_write_q  <= 1'b0;
-            undo_write_mode_q <= 1'b0;
-            undo_write_addr_q <= 4'h0;
-            undo_write_data_q <= 4'h0;
             for (i = 0; i < 4; i = i + 1) begin
                 ram_q[i] <= 4'h0;
             end
         end else if (ena) begin
+            a2 = arg_a_q[1:0];
             case (phase_q)
                 P0_INSTR: begin
                     ir_class_q <= ui_in[7:5];
@@ -374,502 +259,230 @@ module tt_um_kazan_rqpu (
                     phase_q <= P3_OUTPUT;
 
                     case (ir_class_q)
-                        CLS_ARITH: begin
-                            snapshot_current_to_prev();
-                            undo_valid_q <= 1'b1;
-                            case (ir_func_q[2:0])
-                                3'd0: begin // ADD
-                                    ext5    = {1'b0, acc_q} + {1'b0, src_val_w};
-                                    acc_q   <= ext5[3:0];
-                                    out_q   <= ext5[3:0];
-                                    flags_q <= flags_from_result(ext5[3:0], ext5[4]);
-                                end
-                                3'd1: begin // ADC
-                                    ext5    = {1'b0, acc_q} + {1'b0, src_val_w} + {4'b0000, flags_q[1]};
-                                    acc_q   <= ext5[3:0];
-                                    out_q   <= ext5[3:0];
-                                    flags_q <= flags_from_result(ext5[3:0], ext5[4]);
-                                end
-                                3'd2: begin // SUB
-                                    ext5    = {1'b0, acc_q} - {1'b0, src_val_w};
-                                    acc_q   <= ext5[3:0];
-                                    out_q   <= ext5[3:0];
-                                    flags_q <= {ext5[3], (acc_q >= src_val_w), (ext5[3:0] == 4'h0)};
-                                end
-                                3'd3: begin // SBC
-                                    ext5    = {1'b0, acc_q} - {1'b0, src_val_w} - {4'b0000, ~flags_q[1]};
-                                    acc_q   <= ext5[3:0];
-                                    out_q   <= ext5[3:0];
-                                    flags_q <= {ext5[3], (acc_q >= (src_val_w + {3'b000, ~flags_q[1]})), (ext5[3:0] == 4'h0)};
-                                end
-                                3'd4: begin // INC
-                                    ext5    = {1'b0, acc_q} + 5'd1;
-                                    acc_q   <= ext5[3:0];
-                                    out_q   <= ext5[3:0];
-                                    flags_q <= flags_from_result(ext5[3:0], ext5[4]);
-                                end
-                                3'd5: begin // DEC
-                                    ext5    = {1'b0, acc_q} - 5'd1;
-                                    acc_q   <= ext5[3:0];
-                                    out_q   <= ext5[3:0];
-                                    flags_q <= {ext5[3], (acc_q != 4'h0), (ext5[3:0] == 4'h0)};
-                                end
-                                3'd6: begin // NEG
-                                    ext5    = 5'd0 - {1'b0, acc_q};
-                                    acc_q   <= ext5[3:0];
-                                    out_q   <= ext5[3:0];
-                                    flags_q <= flags_from_result(ext5[3:0], (acc_q != 4'h0));
-                                end
-                                default: begin // PASS
-                                    acc_q   <= src_val_w;
-                                    out_q   <= src_val_w;
-                                    flags_q <= flags_from_result(src_val_w, 1'b0);
-                                end
-                            endcase
-                        end
-
-                        CLS_LOGIC: begin
-                            snapshot_current_to_prev();
-                            undo_valid_q <= 1'b1;
-                            case (ir_func_q[2:0])
-                                3'd0: begin // AND
-                                    tmp_data = acc_q & src_val_w;
-                                    acc_q   <= tmp_data;
-                                    out_q   <= tmp_data;
-                                    flags_q <= flags_from_result(tmp_data, 1'b0);
-                                end
-                                3'd1: begin // OR
-                                    tmp_data = acc_q | src_val_w;
-                                    acc_q   <= tmp_data;
-                                    out_q   <= tmp_data;
-                                    flags_q <= flags_from_result(tmp_data, 1'b0);
-                                end
-                                3'd2: begin // XOR
-                                    tmp_data = acc_q ^ src_val_w;
-                                    acc_q   <= tmp_data;
-                                    out_q   <= tmp_data;
-                                    flags_q <= flags_from_result(tmp_data, 1'b0);
-                                end
-                                3'd3: begin // NAND
-                                    tmp_data = ~(acc_q & src_val_w);
-                                    acc_q   <= tmp_data;
-                                    out_q   <= tmp_data;
-                                    flags_q <= flags_from_result(tmp_data, 1'b0);
-                                end
-                                3'd4: begin // NOT
-                                    tmp_data = ~acc_q;
-                                    acc_q   <= tmp_data;
-                                    out_q   <= tmp_data;
-                                    flags_q <= flags_from_result(tmp_data, 1'b0);
-                                end
-                                3'd5: begin // BIC
-                                    tmp_data = acc_q & ~src_val_w;
-                                    acc_q   <= tmp_data;
-                                    out_q   <= tmp_data;
-                                    flags_q <= flags_from_result(tmp_data, 1'b0);
-                                end
-                                3'd6: begin // XNOR
-                                    tmp_data = ~(acc_q ^ src_val_w);
-                                    acc_q   <= tmp_data;
-                                    out_q   <= tmp_data;
-                                    flags_q <= flags_from_result(tmp_data, 1'b0);
-                                end
-                                default: begin // TEST (flags/output only)
-                                    tmp_data = acc_q & src_val_w;
-                                    out_q   <= tmp_data;
-                                    flags_q <= flags_from_result(tmp_data, 1'b0);
-                                end
-                            endcase
-                        end
-
-                        CLS_SHIFT: begin
-                            snapshot_current_to_prev();
-                            undo_valid_q <= 1'b1;
-                            case (ir_func_q[2:0])
-                                3'd0: begin // SHL
-                                    tmp_data = {acc_q[2:0], 1'b0};
-                                    acc_q   <= tmp_data;
-                                    out_q   <= tmp_data;
-                                    flags_q <= flags_from_result(tmp_data, acc_q[3]);
-                                end
-                                3'd1: begin // SHR
-                                    tmp_data = {1'b0, acc_q[3:1]};
-                                    acc_q   <= tmp_data;
-                                    out_q   <= tmp_data;
-                                    flags_q <= flags_from_result(tmp_data, acc_q[0]);
-                                end
-                                3'd2: begin // ROL
-                                    tmp_data = {acc_q[2:0], acc_q[3]};
-                                    acc_q   <= tmp_data;
-                                    out_q   <= tmp_data;
-                                    flags_q <= flags_from_result(tmp_data, acc_q[3]);
-                                end
-                                3'd3: begin // ROR
-                                    tmp_data = {acc_q[0], acc_q[3:1]};
-                                    acc_q   <= tmp_data;
-                                    out_q   <= tmp_data;
-                                    flags_q <= flags_from_result(tmp_data, acc_q[0]);
-                                end
-                                3'd4: begin // SWAP2
-                                    tmp_data = swap2_4(acc_q);
-                                    acc_q   <= tmp_data;
-                                    out_q   <= tmp_data;
-                                    flags_q <= flags_from_result(tmp_data, 1'b0);
-                                end
-                                3'd5: begin // BITREV
-                                    tmp_data = bitrev4(acc_q);
-                                    acc_q   <= tmp_data;
-                                    out_q   <= tmp_data;
-                                    flags_q <= flags_from_result(tmp_data, 1'b0);
-                                end
-                                3'd6: begin // ASR
-                                    tmp_data = {acc_q[3], acc_q[3:1]};
-                                    acc_q   <= tmp_data;
-                                    out_q   <= tmp_data;
-                                    flags_q <= flags_from_result(tmp_data, acc_q[0]);
-                                end
-                                default: begin // PARITY
-                                    tmp_data = {3'b000, ^acc_q};
-                                    out_q   <= tmp_data;
-                                    flags_q <= flags_from_result(tmp_data, ^acc_q);
-                                end
-                            endcase
-                        end
-
-                        CLS_CMP: begin
-                            snapshot_current_to_prev();
-                            undo_valid_q <= 1'b1;
-                            case (ir_func_q[2:0])
-                                3'd0: begin // CMP flags-only
-                                    tmp_data = {1'b0, (acc_q > src_val_w), (acc_q == src_val_w), (acc_q < src_val_w)};
-                                    out_q    <= tmp_data;
-                                    flags_q  <= {(acc_q < src_val_w), (acc_q > src_val_w), (acc_q == src_val_w)};
-                                end
-                                3'd1: begin // EQ -> 0/1 in ACC
-                                    tmp_data = {3'b000, (acc_q == src_val_w)};
-                                    acc_q    <= tmp_data;
-                                    out_q    <= tmp_data;
-                                    flags_q  <= flags_from_result(tmp_data, 1'b0);
-                                end
-                                3'd2: begin // GT -> 0/1 in ACC
-                                    tmp_data = {3'b000, (acc_q > src_val_w)};
-                                    acc_q    <= tmp_data;
-                                    out_q    <= tmp_data;
-                                    flags_q  <= flags_from_result(tmp_data, 1'b0);
-                                end
-                                3'd3: begin // LT -> 0/1 in ACC
-                                    tmp_data = {3'b000, (acc_q < src_val_w)};
-                                    acc_q    <= tmp_data;
-                                    out_q    <= tmp_data;
-                                    flags_q  <= flags_from_result(tmp_data, 1'b0);
-                                end
-                                3'd4: begin // MIN
-                                    tmp_data = (acc_q <= src_val_w) ? acc_q : src_val_w;
-                                    acc_q    <= tmp_data;
-                                    out_q    <= tmp_data;
-                                    flags_q  <= flags_from_result(tmp_data, 1'b0);
-                                end
-                                3'd5: begin // MAX
-                                    tmp_data = (acc_q >= src_val_w) ? acc_q : src_val_w;
-                                    acc_q    <= tmp_data;
-                                    out_q    <= tmp_data;
-                                    flags_q  <= flags_from_result(tmp_data, 1'b0);
-                                end
-                                3'd6: begin // POPCOUNT
-                                    tmp_data = popcount4(acc_q);
-                                    acc_q    <= tmp_data;
-                                    out_q    <= tmp_data;
-                                    flags_q  <= flags_from_result(tmp_data, 1'b0);
-                                end
-                                default: begin // ZERO? of ACC
-                                    tmp_data = {3'b000, (acc_q == 4'h0)};
-                                    acc_q    <= tmp_data;
-                                    out_q    <= tmp_data;
-                                    flags_q  <= flags_from_result(tmp_data, 1'b0);
-                                end
-                            endcase
-                        end
-
-                        CLS_MEM: begin
-                            snapshot_current_to_prev();
-                            undo_valid_q <= 1'b1;
+                        // -------------------------------------------------
+                        // 000: ALU family (use arg_b_q as immediate source)
+                        // -------------------------------------------------
+                        CLS_ALU: begin
+                            checkpoint_no_write();
                             case (ir_func_q[1:0])
-                                2'd0: begin // READ
-                                    tmp_data = mapped_read(ir_mode_q, arg_a_q);
-                                    mdr_q   <= tmp_data;
-                                    out_q   <= tmp_data;
-                                    flags_q <= flags_from_result(tmp_data, 1'b0);
+                                2'b00: begin // ADD
+                                    ext5 = {1'b0, acc_q} + {1'b0, arg_b_q};
+                                    acc_q <= ext5[3:0];
+                                    out_q <= ext5[3:0];
+                                    z_q   <= (ext5[3:0] == 4'h0);
+                                    c_q   <= ext5[4];
+                                end
+                                2'b01: begin // XOR
+                                    tmp_data = acc_q ^ arg_b_q;
+                                    acc_q <= tmp_data;
+                                    out_q <= tmp_data;
+                                    z_q   <= (tmp_data == 4'h0);
+                                    c_q   <= 1'b0;
+                                end
+                                2'b10: begin // AND
+                                    tmp_data = acc_q & arg_b_q;
+                                    acc_q <= tmp_data;
+                                    out_q <= tmp_data;
+                                    z_q   <= (tmp_data == 4'h0);
+                                    c_q   <= 1'b0;
+                                end
+                                default: begin // OR
+                                    tmp_data = acc_q | arg_b_q;
+                                    acc_q <= tmp_data;
+                                    out_q <= tmp_data;
+                                    z_q   <= (tmp_data == 4'h0);
+                                    c_q   <= 1'b0;
+                                end
+                            endcase
+                        end
+
+                        // -------------------------------------------------
+                        // 001: Permute family
+                        // -------------------------------------------------
+                        CLS_PERM: begin
+                            checkpoint_no_write();
+                            case (ir_func_q[1:0])
+                                2'b00: begin // ROL
+                                    tmp_data = {acc_q[2:0], acc_q[3]};
+                                    acc_q <= tmp_data;
+                                    out_q <= tmp_data;
+                                    z_q   <= (tmp_data == 4'h0);
+                                    c_q   <= acc_q[3];
+                                end
+                                2'b01: begin // ROR
+                                    tmp_data = {acc_q[0], acc_q[3:1]};
+                                    acc_q <= tmp_data;
+                                    out_q <= tmp_data;
+                                    z_q   <= (tmp_data == 4'h0);
+                                    c_q   <= acc_q[0];
+                                end
+                                2'b10: begin // SWAP2
+                                    tmp_data = swap2_4(acc_q);
+                                    acc_q <= tmp_data;
+                                    out_q <= tmp_data;
+                                    z_q   <= (tmp_data == 4'h0);
+                                    c_q   <= 1'b0;
+                                end
+                                default: begin // BITREV
+                                    tmp_data = bitrev4(acc_q);
+                                    acc_q <= tmp_data;
+                                    out_q <= tmp_data;
+                                    z_q   <= (tmp_data == 4'h0);
+                                    c_q   <= 1'b0;
+                                end
+                            endcase
+                        end
+
+                        // -------------------------------------------------
+                        // 010: Memory family
+                        // mode=0 RAM[0:3], mode=1 SYS{ACC,SHD,FLAGS,OUT}
+                        // -------------------------------------------------
+                        CLS_MEM: begin
+                            case (ir_func_q[1:0])
+                                2'b00: begin // READ (non-mutating)
+                                    tmp_data = mapped_read(ir_mode_q, a2);
+                                    out_q <= tmp_data;
+                                    z_q   <= (tmp_data == 4'h0);
+                                    c_q   <= 1'b0;
                                 end
 
-                                2'd1: begin // WRITE
+                                2'b01: begin // WRITE
                                     if (ir_mode_q) begin
-                                        if (is_writable_sys_addr(arg_a_q)) begin
-                                            undo_has_write_q  <= 1'b1;
-                                            undo_write_mode_q <= 1'b1;
-                                            undo_write_addr_q <= arg_a_q;
-                                            undo_write_data_q <= sys_read(arg_a_q);
-                                            write_current_sys_reg(arg_a_q, arg_b_q);
-                                        end
-                                        if (arg_a_q == SYS_FLAGS) begin
-                                            mdr_q   <= {1'b0, arg_b_q[2:0]};
-                                            out_q   <= {1'b0, arg_b_q[2:0]};
-                                            flags_q <= arg_b_q[2:0];
-                                        end else begin
-                                            mdr_q   <= arg_b_q;
-                                            out_q   <= arg_b_q;
-                                            flags_q <= flags_from_result(arg_b_q, 1'b0);
+                                        checkpoint_no_write();
+                                        write_sys(a2, arg_b_q);
+                                        out_q <= arg_b_q;
+                                        if (a2 != SYS_FLAGS) begin
+                                            z_q <= (arg_b_q == 4'h0);
+                                            c_q <= 1'b0;
                                         end
                                     end else begin
-                                        undo_has_write_q  <= 1'b1;
-                                        undo_write_mode_q <= 1'b0;
-                                        undo_write_addr_q <= arg_a_q;
-                                        undo_write_data_q <= ram_q[arg_a_q[1:0]];
-                                        ram_q[arg_a_q[1:0]] <= arg_b_q;
-                                        mdr_q          <= arg_b_q;
-                                        out_q          <= arg_b_q;
-                                        flags_q        <= flags_from_result(arg_b_q, 1'b0);
+                                        checkpoint_ram_write(a2, ram_q[a2]);
+                                        ram_q[a2] <= arg_b_q;
+                                        out_q <= arg_b_q;
+                                        z_q   <= (arg_b_q == 4'h0);
+                                        c_q   <= 1'b0;
                                     end
                                 end
 
-                                2'd2: begin // LOADACC
-                                    tmp_data = mapped_read(ir_mode_q, arg_a_q);
-                                    acc_q   <= tmp_data;
-                                    mdr_q   <= tmp_data;
-                                    out_q   <= tmp_data;
-                                    flags_q <= flags_from_result(tmp_data, 1'b0);
+                                2'b10: begin // LOADACC
+                                    checkpoint_no_write();
+                                    tmp_data = mapped_read(ir_mode_q, a2);
+                                    acc_q <= tmp_data;
+                                    out_q <= tmp_data;
+                                    z_q   <= (tmp_data == 4'h0);
+                                    c_q   <= 1'b0;
                                 end
 
                                 default: begin // SWAPACC
-                                    if (!ir_mode_q) begin
-                                        undo_has_write_q  <= 1'b1;
-                                        undo_write_mode_q <= 1'b0;
-                                        undo_write_addr_q <= arg_a_q;
-                                        tmp_data      = ram_q[arg_a_q[1:0]];
-                                        undo_write_data_q <= tmp_data;
-                                        ram_q[arg_a_q[1:0]] <= acc_q;
-                                        acc_q         <= tmp_data;
-                                        mdr_q         <= tmp_data;
-                                        out_q         <= tmp_data;
-                                        flags_q       <= flags_from_result(tmp_data, 1'b0);
-                                    end else if (is_gp_sys_addr(arg_a_q)) begin
-                                        undo_has_write_q  <= 1'b1;
-                                        undo_write_mode_q <= 1'b1;
-                                        undo_write_addr_q <= arg_a_q;
-                                        tmp_data = sys_read(arg_a_q);
-                                        undo_write_data_q <= tmp_data;
-                                        write_current_sys_reg(arg_a_q, acc_q);
-                                        acc_q    <= tmp_data;
-                                        mdr_q    <= tmp_data;
-                                        out_q    <= tmp_data;
-                                        flags_q  <= flags_from_result(tmp_data, 1'b0);
+                                    if (ir_mode_q) begin
+                                        checkpoint_no_write();
+                                        old_mapped = sys_read(a2);
+                                        write_sys(a2, acc_q);
+                                        acc_q <= old_mapped;
+                                        out_q <= old_mapped;
+                                        z_q   <= (old_mapped == 4'h0);
+                                        c_q   <= 1'b0;
                                     end else begin
-                                        out_q   <= acc_q;
-                                        flags_q <= flags_from_result(acc_q, 1'b0);
+                                        checkpoint_ram_write(a2, ram_q[a2]);
+                                        tmp_data = ram_q[a2];
+                                        ram_q[a2] <= acc_q;
+                                        acc_q <= tmp_data;
+                                        out_q <= tmp_data;
+                                        z_q   <= (tmp_data == 4'h0);
+                                        c_q   <= 1'b0;
                                     end
                                 end
                             endcase
                         end
 
-                        CLS_SYS: begin
-                            snapshot_current_to_prev();
-                            undo_valid_q <= 1'b1;
-                            case (ir_func_q[1:0])
-                                2'd0: begin // MOV sys[B] <= sys[A]
-                                    if (is_gp_sys_addr(arg_b_q)) begin
-                                        tmp_data = sys_a_val_w;
-                                        undo_has_write_q  <= 1'b1;
-                                        undo_write_mode_q <= 1'b1;
-                                        undo_write_addr_q <= arg_b_q;
-                                        undo_write_data_q <= sys_b_val_w;
-                                        write_current_sys_reg(arg_b_q, tmp_data);
-                                        out_q   <= tmp_data;
-                                        flags_q <= flags_from_result(tmp_data, 1'b0);
-                                    end
-                                end
-
-                                2'd1: begin // SWAP sys[A] <-> sys[B]
-                                    if (is_gp_sys_addr(arg_a_q) && is_gp_sys_addr(arg_b_q)) begin
-                                        tmp_data   = sys_a_val_w;
-                                        tmp_data_b = sys_b_val_w;
-                                        undo_has_write_q  <= 1'b1;
-                                        undo_write_mode_q <= 1'b1;
-                                        undo_write_addr_q <= arg_b_q;
-                                        undo_write_data_q <= tmp_data_b;
-                                        write_current_sys_reg(arg_a_q, tmp_data_b);
-                                        write_current_sys_reg(arg_b_q, tmp_data);
-                                        out_q   <= tmp_data_b;
-                                        flags_q <= flags_from_result(tmp_data_b, 1'b0);
-                                    end
-                                end
-
-                                2'd2: begin // CLEAR sys[A]
-                                    if (is_gp_sys_addr(arg_a_q) || (arg_a_q == SYS_OUT)) begin
-                                        undo_has_write_q  <= 1'b1;
-                                        undo_write_mode_q <= 1'b1;
-                                        undo_write_addr_q <= arg_a_q;
-                                        undo_write_data_q <= sys_a_val_w;
-                                        write_current_sys_reg(arg_a_q, 4'h0);
-                                        out_q   <= 4'h0;
-                                        flags_q <= flags_from_result(4'h0, 1'b0);
-                                    end
-                                end
-
-                                default: begin // LOADIMM sys[A] <= B
-                                    if (is_gp_sys_addr(arg_a_q) || (arg_a_q == SYS_OUT)) begin
-                                        undo_has_write_q  <= 1'b1;
-                                        undo_write_mode_q <= 1'b1;
-                                        undo_write_addr_q <= arg_a_q;
-                                        undo_write_data_q <= sys_a_val_w;
-                                        write_current_sys_reg(arg_a_q, arg_b_q);
-                                        out_q   <= arg_b_q;
-                                        flags_q <= flags_from_result(arg_b_q, 1'b0);
-                                    end
-                                end
-                            endcase
-                        end
-
+                        // -------------------------------------------------
+                        // 011: Reversible family
+                        // -------------------------------------------------
                         CLS_REV: begin
-                            case (ir_func_q)
-                                4'h0: begin // SAVE checkpoint
-                                    snapshot_current_to_prev();
-                                    undo_valid_q <= 1'b1;
-                                    out_q        <= acc_q;
+                            case (ir_func_q[1:0])
+                                2'b00: begin // SAVE
+                                    checkpoint_no_write();
+                                    out_q <= acc_q;
+                                    z_q   <= (acc_q == 4'h0);
+                                    c_q   <= 1'b0;
                                 end
 
-                                4'h1: begin // REVERSE (undo/redo swap)
+                                2'b01: begin // REVERSE (single-step restore)
                                     if (undo_valid_q) begin
-                                        swap_current_and_prev();
+                                        if (undo_write_valid_q && !undo_write_mode_q) begin
+                                            ram_q[undo_write_addr_q] <= undo_write_olddata_q;
+                                        end
+                                        acc_q <= prev_acc_q;
+                                        shd_q <= prev_shd_q;
+                                        out_q <= prev_out_q;
+                                        z_q   <= prev_z_q;
+                                        c_q   <= prev_c_q;
+                                        undo_valid_q <= 1'b0;
+                                        undo_write_valid_q <= 1'b0;
+                                    end else begin
+                                        out_q <= acc_q;
+                                        z_q   <= z_q;
+                                        c_q   <= c_q;
                                     end
                                 end
 
-                                4'h2: begin // SWAP ACC <-> SHD
-                                    snapshot_current_to_prev();
-                                    undo_valid_q <= 1'b1;
-                                    acc_q        <= shd_q;
-                                    shd_q        <= acc_q;
-                                    out_q        <= shd_q;
-                                    flags_q      <= flags_from_result(shd_q, 1'b0);
+                                2'b10: begin // ACC <-> SHD
+                                    checkpoint_no_write();
+                                    acc_q <= shd_q;
+                                    shd_q <= acc_q;
+                                    out_q <= shd_q;
+                                    z_q   <= (shd_q == 4'h0);
+                                    c_q   <= 1'b0;
                                 end
 
-                                4'h3: begin // SWAP ACC <-> BREG
-                                    snapshot_current_to_prev();
-                                    undo_valid_q <= 1'b1;
-                                    acc_q        <= breg_q;
-                                    breg_q       <= acc_q;
-                                    out_q        <= breg_q;
-                                    flags_q      <= flags_from_result(breg_q, 1'b0);
-                                end
-
-                                default: begin // CLEAR undo state
-                                    clear_prev_snapshot();
-                                    undo_valid_q <= 1'b0;
-                                    out_q        <= acc_q;
+                                default: begin // PARITY
+                                    tmp_data = parity4(acc_q);
+                                    out_q <= tmp_data;
+                                    z_q   <= (tmp_data == 4'h0);
+                                    c_q   <= 1'b0;
                                 end
                             endcase
                         end
 
-                        default: begin // CLS_CTRL
-                            case (ir_func_q)
-                                4'h0: begin // NOP
-                                    out_q <= out_q;
+                        // -------------------------------------------------
+                        // 100: Control / flags family
+                        // -------------------------------------------------
+                        CLS_CTRL: begin
+                            case (ir_func_q[1:0])
+                                2'b00: begin // SETACC immediate
+                                    checkpoint_no_write();
+                                    acc_q <= arg_b_q;
+                                    out_q <= arg_b_q;
+                                    z_q   <= (arg_b_q == 4'h0);
+                                    c_q   <= 1'b0;
                                 end
-
-                                4'h1: begin // CLR_ACC
-                                    snapshot_current_to_prev();
-                                    undo_valid_q <= 1'b1;
-                                    acc_q        <= 4'h0;
-                                    out_q        <= 4'h0;
-                                    flags_q      <= flags_from_result(4'h0, 1'b0);
+                                2'b01: begin // SETSHD immediate
+                                    checkpoint_no_write();
+                                    shd_q <= arg_b_q;
+                                    out_q <= arg_b_q;
+                                    z_q   <= (arg_b_q == 4'h0);
+                                    c_q   <= 1'b0;
                                 end
-
-                                4'h2: begin // CLR_ALL current state
-                                    snapshot_current_to_prev();
-                                    undo_valid_q <= 1'b1;
-                                    clear_current_state();
+                                2'b10: begin // CMP flags
+                                    out_q <= {2'b00, (acc_q > arg_b_q), (acc_q == arg_b_q)};
+                                    z_q   <= (acc_q == arg_b_q);
+                                    c_q   <= (acc_q >= arg_b_q);
                                 end
-
-                                4'h3: begin // MAR <= B
-                                    snapshot_current_to_prev();
-                                    undo_valid_q <= 1'b1;
-                                    mar_q        <= arg_b_q;
-                                    out_q        <= arg_b_q;
-                                    flags_q      <= flags_from_result(arg_b_q, 1'b0);
-                                end
-
-                                4'h4: begin // BREG <= B
-                                    snapshot_current_to_prev();
-                                    undo_valid_q <= 1'b1;
-                                    breg_q       <= arg_b_q;
-                                    out_q        <= arg_b_q;
-                                    flags_q      <= flags_from_result(arg_b_q, 1'b0);
-                                end
-
-                                4'h5: begin // SHD <= B
-                                    snapshot_current_to_prev();
-                                    undo_valid_q <= 1'b1;
-                                    shd_q        <= arg_b_q;
-                                    out_q        <= arg_b_q;
-                                    flags_q      <= flags_from_result(arg_b_q, 1'b0);
-                                end
-
-                                4'h6: begin // TMP0 <= B
-                                    snapshot_current_to_prev();
-                                    undo_valid_q <= 1'b1;
-                                    tmp0_q       <= arg_b_q;
-                                    out_q        <= arg_b_q;
-                                    flags_q      <= flags_from_result(arg_b_q, 1'b0);
-                                end
-
-                                4'h7: begin // TMP1 <= B
-                                    snapshot_current_to_prev();
-                                    undo_valid_q <= 1'b1;
-                                    tmp1_q       <= arg_b_q;
-                                    out_q        <= arg_b_q;
-                                    flags_q      <= flags_from_result(arg_b_q, 1'b0);
-                                end
-
-                                4'h8: begin // EXT0 <= B
-                                    snapshot_current_to_prev();
-                                    undo_valid_q <= 1'b1;
-                                    ext0_q       <= arg_b_q;
-                                    out_q        <= arg_b_q;
-                                    flags_q      <= flags_from_result(arg_b_q, 1'b0);
-                                end
-
-                                4'h9: begin // EXT1 <= B
-                                    snapshot_current_to_prev();
-                                    undo_valid_q <= 1'b1;
-                                    ext1_q       <= arg_b_q;
-                                    out_q        <= arg_b_q;
-                                    flags_q      <= flags_from_result(arg_b_q, 1'b0);
-                                end
-
-                                4'hA: begin // ACC <= B
-                                    snapshot_current_to_prev();
-                                    undo_valid_q <= 1'b1;
-                                    acc_q        <= arg_b_q;
-                                    out_q        <= arg_b_q;
-                                    flags_q      <= flags_from_result(arg_b_q, 1'b0);
-                                end
-
-                                4'hB: begin // OUT <= B
-                                    snapshot_current_to_prev();
-                                    undo_valid_q <= 1'b1;
-                                    out_q        <= arg_b_q;
-                                    flags_q      <= flags_from_result(arg_b_q, 1'b0);
-                                end
-
-                                4'hC: begin // FLAGS <= B[2:0]
-                                    snapshot_current_to_prev();
-                                    undo_valid_q <= 1'b1;
-                                    flags_q      <= arg_b_q[2:0];
-                                    out_q        <= {1'b0, arg_b_q[2:0]};
-                                end
-
-                                default: begin // reserved -> NOP-like
-                                    out_q <= out_q;
+                                default: begin // CLEAR working state (not RAM)
+                                    checkpoint_no_write();
+                                    acc_q <= 4'h0;
+                                    shd_q <= 4'h0;
+                                    out_q <= 4'h0;
+                                    z_q   <= 1'b1;
+                                    c_q   <= 1'b0;
                                 end
                             endcase
+                        end
+
+                        default: begin // reserved NOP
+                            out_q <= acc_q;
+                            z_q   <= (acc_q == 4'h0);
+                            c_q   <= c_q;
                         end
                     endcase
                 end
@@ -882,18 +495,14 @@ module tt_um_kazan_rqpu (
     end
 
     // ---------------------------------------------------------------------
-    // Public bus mapping
+    // Public bus packing
     // ---------------------------------------------------------------------
-    assign uo_out[7:6] = phase_q;
-    assign uo_out[5:2] = out_q;
-    assign uo_out[1]   = flags_q[0];
-    assign uo_out[0]   = flags_q[1];
+    assign uo_out = {phase_q, out_q, z_q, c_q};
 
     assign uio_out = 8'h00;
     assign uio_oe  = 8'h00;
 
     wire _unused = &{1'b0, uio_in};
-
 endmodule
 
 `default_nettype wire

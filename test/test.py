@@ -7,19 +7,30 @@ P1_OPERAND = 0b01
 P2_EXECUTE = 0b10
 P3_OUTPUT = 0b11
 
-CLS_ARITH = 0b000
-CLS_MEM = 0b100
-CLS_REV = 0b110
-CLS_CTRL = 0b111
+CLS_ALU = 0b000
+CLS_PERM = 0b001
+CLS_MEM = 0b010
+CLS_REV = 0b011
+CLS_CTRL = 0b100
 
-FUNC_ADD = 0x0
+ALU_ADD = 0x0
+PERM_SWAP2 = 0x2
 MEM_READ = 0x0
 MEM_WRITE = 0x1
 MEM_LOADACC = 0x2
+REV_SAVE = 0x0
 REV_REVERSE = 0x1
-CTRL_SET_ACC_IMM = 0xA
+REV_SWAP_ACC_SHD = 0x2
+REV_PARITY = 0x3
+CTRL_SETACC = 0x0
+CTRL_SETSHD = 0x1
+CTRL_CMP = 0x2
+CTRL_CLEAR = 0x3
 
-SYS_TMP0 = 0xC
+SYS_ACC = 0x0
+SYS_SHD = 0x1
+SYS_FLAGS = 0x2
+SYS_OUT = 0x3
 
 
 def pack_instr(cls: int, mode: int, func: int) -> int:
@@ -91,19 +102,14 @@ async def issue(dut, cls: int, mode: int, func: int, a: int = 0, b: int = 0) -> 
     await sync_p0_writable(dut)
 
     dut.ui_in.value = pack_instr(cls, mode, func)
-    s1 = await advance_and_check(dut, P1_OPERAND)
-    dut._log.info(f"P1 ui_in={int(dut.ui_in.value):08b} uo_out={s1['raw']:08b}")
+    _ = await advance_and_check(dut, P1_OPERAND)
 
     await Timer(1, unit="ns")
     dut.ui_in.value = pack_oper(a, b)
-    s2 = await advance_and_check(dut, P2_EXECUTE)
-    dut._log.info(f"P2 ui_in={int(dut.ui_in.value):08b} uo_out={s2['raw']:08b}")
+    _ = await advance_and_check(dut, P2_EXECUTE)
 
     s3 = await advance_and_check(dut, P3_OUTPUT)
-    dut._log.info(f"P3 ui_in={int(dut.ui_in.value):08b} uo_out={s3['raw']:08b}")
-
-    s0 = await advance_and_check(dut, P0_INSTR)
-    dut._log.info(f"P0 ui_in={int(dut.ui_in.value):08b} uo_out={s0['raw']:08b}")
+    _ = await advance_and_check(dut, P0_INSTR)
 
     await Timer(1, unit="ns")
     dut.ui_in.value = 0
@@ -111,21 +117,40 @@ async def issue(dut, cls: int, mode: int, func: int, a: int = 0, b: int = 0) -> 
 
 
 @cocotb.test()
-async def test_rqpu_v2_protocol_and_memory(dut):
+async def test_rqpu_v2_fit(dut):
     cocotb.start_soon(Clock(dut.clk, 10, unit="us").start())
     await reset_dut(dut)
 
-    out = await issue(dut, CLS_CTRL, 0, CTRL_SET_ACC_IMM, 0x0, 0x6)
+    out = await issue(dut, CLS_CTRL, 0, CTRL_SETACC, 0x0, 0x6)
     assert out["data"] == 0x6 and out["z"] == 0 and out["c"] == 0, out
 
-    out = await issue(dut, CLS_ARITH, 0, FUNC_ADD, 0x0, 0x3)
+    out = await issue(dut, CLS_ALU, 0, ALU_ADD, 0x0, 0x3)
     assert out["data"] == 0x9 and out["z"] == 0 and out["c"] == 0, out
 
     out = await issue(dut, CLS_REV, 0, REV_REVERSE, 0x0, 0x0)
     assert out["data"] == 0x6 and out["z"] == 0 and out["c"] == 0, out
 
+    # Single-step reverse is consumed; a second reverse is a no-op.
     out = await issue(dut, CLS_REV, 0, REV_REVERSE, 0x0, 0x0)
     assert out["data"] == 0x6 and out["z"] == 0 and out["c"] == 0, out
+
+    out = await issue(dut, CLS_CTRL, 0, CTRL_SETSHD, 0x0, 0x5)
+    assert out["data"] == 0x5 and out["z"] == 0, out
+
+    out = await issue(dut, CLS_MEM, 1, MEM_READ, SYS_SHD, 0x0)
+    assert out["data"] == 0x5 and out["z"] == 0, out
+
+    out = await issue(dut, CLS_REV, 0, REV_SWAP_ACC_SHD, 0x0, 0x0)
+    assert out["data"] == 0x5 and out["z"] == 0, out
+
+    out = await issue(dut, CLS_MEM, 1, MEM_READ, SYS_ACC, 0x0)
+    assert out["data"] == 0x5 and out["z"] == 0, out
+
+    out = await issue(dut, CLS_REV, 0, REV_REVERSE, 0x0, 0x0)
+    assert out["data"] == 0x5 and out["z"] == 0, out
+
+    out = await issue(dut, CLS_MEM, 1, MEM_READ, SYS_ACC, 0x0)
+    assert out["data"] == 0x6 and out["z"] == 0, out
 
     out = await issue(dut, CLS_MEM, 0, MEM_WRITE, 0x3, 0xC)
     assert out["data"] == 0xC and out["z"] == 0, out
@@ -133,11 +158,17 @@ async def test_rqpu_v2_protocol_and_memory(dut):
     out = await issue(dut, CLS_MEM, 0, MEM_READ, 0x3, 0x0)
     assert out["data"] == 0xC and out["z"] == 0, out
 
-    out = await issue(dut, CLS_MEM, 1, MEM_WRITE, SYS_TMP0, 0x7)
-    assert out["data"] == 0x7 and out["z"] == 0, out
+    out = await issue(dut, CLS_MEM, 0, MEM_LOADACC, 0x3, 0x0)
+    assert out["data"] == 0xC and out["z"] == 0, out
 
-    out = await issue(dut, CLS_MEM, 1, MEM_READ, SYS_TMP0, 0x0)
-    assert out["data"] == 0x7 and out["z"] == 0, out
+    out = await issue(dut, CLS_PERM, 0, PERM_SWAP2, 0x0, 0x0)
+    assert out["data"] == 0x3 and out["z"] == 0, out
+
+    out = await issue(dut, CLS_REV, 0, REV_PARITY, 0x0, 0x0)
+    assert out["data"] in (0x0, 0x1), out
+
+    out = await issue(dut, CLS_CTRL, 0, CTRL_CMP, 0x0, 0x3)
+    assert out["z"] == 1 and out["c"] == 1, out
 
     out = await issue(dut, CLS_MEM, 0, MEM_WRITE, 0x3, 0xA)
     assert out["data"] == 0xA and out["z"] == 0, out
@@ -145,9 +176,6 @@ async def test_rqpu_v2_protocol_and_memory(dut):
     _ = await issue(dut, CLS_REV, 0, REV_REVERSE, 0x0, 0x0)
 
     out = await issue(dut, CLS_MEM, 0, MEM_READ, 0x3, 0x0)
-    assert out["data"] == 0xC and out["z"] == 0, out
-
-    out = await issue(dut, CLS_MEM, 0, MEM_LOADACC, 0x3, 0x0)
     assert out["data"] == 0xC and out["z"] == 0, out
 
     # RAM is 4x4, so RAM addresses decode with low 2 bits only.
