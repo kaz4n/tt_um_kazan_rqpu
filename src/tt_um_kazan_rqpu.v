@@ -129,24 +129,8 @@ module tt_um_kazan_rqpu (
     function [3:0] popcount4;
         input [3:0] value;
         begin
-            case (value)
-                4'b0000: popcount4 = 4'd0;
-                4'b0001,
-                4'b0010,
-                4'b0100,
-                4'b1000: popcount4 = 4'd1;
-                4'b0011,
-                4'b0101,
-                4'b0110,
-                4'b1001,
-                4'b1010,
-                4'b1100: popcount4 = 4'd2;
-                4'b0111,
-                4'b1011,
-                4'b1101,
-                4'b1110: popcount4 = 4'd3;
-                default: popcount4 = 4'd4;
-            endcase
+            popcount4 = {2'b00, value[0]} + {2'b00, value[1]} +
+                        {2'b00, value[2]} + {2'b00, value[3]};
         end
     endfunction
 
@@ -240,7 +224,6 @@ module tt_um_kazan_rqpu (
     endfunction
 
     wire [3:0] src_val_w    = ir_mode_q ? sys_read(arg_a_q) : arg_b_q;
-    wire [3:0] mapped_val_w = mapped_read(ir_mode_q, arg_a_q);
     wire [3:0] sys_a_val_w  = sys_read(arg_a_q);
     wire [3:0] sys_b_val_w  = sys_read(arg_b_q);
 
@@ -647,14 +630,10 @@ module tt_um_kazan_rqpu (
                             undo_valid_q <= 1'b1;
                             case (ir_func_q[1:0])
                                 2'd0: begin // READ
-                                    if (ir_mode_q) begin
-        tmp_data = sys_read(arg_a_q);
-    end else begin
-        tmp_data = ram_q[arg_a_q[1:0]];
-    end
-    mdr_q   <= tmp_data;
-    out_q   <= tmp_data;
-    flags_q <= flags_from_result(tmp_data, 1'b0);
+                                    tmp_data = mapped_read(ir_mode_q, arg_a_q);
+                                    mdr_q   <= tmp_data;
+                                    out_q   <= tmp_data;
+                                    flags_q <= flags_from_result(tmp_data, 1'b0);
                                 end
 
                                 2'd1: begin // WRITE
@@ -680,15 +659,11 @@ module tt_um_kazan_rqpu (
                                 end
 
                                 2'd2: begin // LOADACC
-                                    if (ir_mode_q) begin
-        tmp_data = sys_read(arg_a_q);
-    end else begin
-        tmp_data = ram_q[arg_a_q[1:0]];
-    end
-    acc_q   <= tmp_data;
-    mdr_q   <= tmp_data;
-    out_q   <= tmp_data;
-    flags_q <= flags_from_result(tmp_data, 1'b0);
+                                    tmp_data = mapped_read(ir_mode_q, arg_a_q);
+                                    acc_q   <= tmp_data;
+                                    mdr_q   <= tmp_data;
+                                    out_q   <= tmp_data;
+                                    flags_q <= flags_from_result(tmp_data, 1'b0);
                                 end
 
                                 default: begin // SWAPACC
