@@ -24,7 +24,7 @@ The core includes:
 - memory and mapped-register access family
 - system register move/clear/immediate helpers
 - reversible/checkpoint operations including save and reverse
-- 5x4 on-chip scratchpad RAM (`RAM[0:4]`)
+- 4x4 on-chip scratchpad RAM (`RAM[0:3]`)
 - memory-mapped internal registers (`ACC`, `BREG`, `SHD`, `FLAGS`, `MAR`, `MDR`, `OUT`, `TMP0`, `TMP1`, `EXT0`, `EXT1`, and previous-state mirrors)
 
 The reversible behavior uses snapshot and swap logic so `REVERSE` can undo/redo recent architectural changes.

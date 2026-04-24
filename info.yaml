@@ -3,7 +3,7 @@ project:
   title:        "tt_um_kazan_rqpu"      # Project title
   author:       "Tarek Alhafez"      # Your name
   discord:      ""      # Your discord username, for communication and automatically assigning you a Tapeout role (optional)
-  description:  "RQPU v2 reversible-computing-inspired 4-bit processor with 4-phase bus and 5x4 RAM"      # One line description of what your project does
+  description:  "RQPU v2 reversible-computing-inspired 4-bit processor with 4-phase bus and 4x4 RAM"      # One line description of what your project does
   language:     "Verilog" # other examples include SystemVerilog, Amaranth, VHDL, etc
   clock_hz:     0       # Clock frequency in Hz (or 0 if not applicable)
 
