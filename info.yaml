@@ -3,7 +3,7 @@ project:
   title:        "tt_um_kazan_rqpu"      # Project title
   author:       "Tarek Alhafez"      # Your name
   discord:      ""      # Your discord username, for communication and automatically assigning you a Tapeout role (optional)
-  description:  "rqpu cpu"      # One line description of what your project does
+  description:  "RQPU v2 reversible-computing-inspired 4-bit processor with 4-phase bus and 8x4 RAM"      # One line description of what your project does
   language:     "Verilog" # other examples include SystemVerilog, Amaranth, VHDL, etc
   clock_hz:     0       # Clock frequency in Hz (or 0 if not applicable)
 
@@ -23,24 +23,24 @@ project:
 # This section is for the datasheet/website. Use descriptive names (e.g., RX, TX, MOSI, SCL, SEG_A, etc.).
 pinout:
   # Inputs
-  ui[0]: "input1"
-  ui[1]: "input2"
-  ui[2]: "input3"
-  ui[3]: "input4"
-  ui[4]: "input5"
-  ui[5]: "input6"
-  ui[6]: "input7"
-  ui[7]: "input8"
+  ui[0]: "func[0] / B[0]"
+  ui[1]: "func[1] / B[1]"
+  ui[2]: "func[2] / B[2]"
+  ui[3]: "func[3] / B[3]"
+  ui[4]: "mode / A[0]"
+  ui[5]: "class[0] / A[1]"
+  ui[6]: "class[1] / A[2]"
+  ui[7]: "class[2] / A[3]"
 
   # Outputs
-  uo[0]: "output1"
-  uo[1]: "output2"
-  uo[2]: "output3"
-  uo[3]: "output4"
-  uo[4]: "output5"
-  uo[5]: "output6"
-  uo[6]: "output7"
-  uo[7]: "output8"
+  uo[0]: "C flag"
+  uo[1]: "Z flag"
+  uo[2]: "result/data[0]"
+  uo[3]: "result/data[1]"
+  uo[4]: "result/data[2]"
+  uo[5]: "result/data[3]"
+  uo[6]: "phase[0]"
+  uo[7]: "phase[1]"
 
   # Bidirectional pins
   uio[0]: ""
