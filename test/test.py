@@ -149,3 +149,10 @@ async def test_rqpu_v2_protocol_and_memory(dut):
 
     out = await issue(dut, CLS_MEM, 0, MEM_LOADACC, 0x3, 0x0)
     assert out["data"] == 0xC and out["z"] == 0, out
+
+    # RAM is 5x4, so RAM addresses wrap modulo 5.
+    out = await issue(dut, CLS_MEM, 0, MEM_WRITE, 0xB, 0x5)
+    assert out["data"] == 0x5 and out["z"] == 0, out
+
+    out = await issue(dut, CLS_MEM, 0, MEM_READ, 0x1, 0x0)
+    assert out["data"] == 0x5 and out["z"] == 0, out

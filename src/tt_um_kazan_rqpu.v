@@ -17,7 +17,7 @@
  *
  * Architectural highlights:
  * - 4-phase deterministic controller protocol
- * - 8x4 scratchpad RAM implemented with registers
+ * - 5x4 scratchpad RAM implemented with registers
  * - Memory-mapped internal registers
  * - Undo/redo style REVERSE operation using current/previous architectural
  *   state swapping
@@ -98,7 +98,7 @@ module tt_um_kazan_rqpu (
     reg [3:0] tmp1_q;
     reg [3:0] ext0_q;
     reg [3:0] ext1_q;
-    reg [3:0] ram_q [0:7];
+    reg [3:0] ram_q [0:4];
 
     reg [3:0] prev_acc_q;
     reg [3:0] prev_breg_q;
@@ -111,7 +111,7 @@ module tt_um_kazan_rqpu (
     reg [3:0] prev_tmp1_q;
     reg [3:0] prev_ext0_q;
     reg [3:0] prev_ext1_q;
-    reg [3:0] prev_ram_q [0:7];
+    reg [3:0] prev_ram_q [0:4];
 
     integer i;
 
@@ -234,8 +234,30 @@ module tt_um_kazan_rqpu (
             if (mode) begin
                 mapped_read = sys_read(addr);
             end else begin
-                mapped_read = ram_q[addr[2:0]];
+                mapped_read = ram_q[ram_index(addr)];
             end
+        end
+    endfunction
+
+    function [2:0] ram_index;
+        input [3:0] addr;
+        begin
+            case (addr)
+                4'h0,
+                4'h5,
+                4'hA,
+                4'hF: ram_index = 3'd0;
+                4'h1,
+                4'h6,
+                4'hB: ram_index = 3'd1;
+                4'h2,
+                4'h7,
+                4'hC: ram_index = 3'd2;
+                4'h3,
+                4'h8,
+                4'hD: ram_index = 3'd3;
+                default: ram_index = 3'd4; // 4,9,E
+            endcase
         end
     endfunction
 
@@ -261,7 +283,7 @@ module tt_um_kazan_rqpu (
             prev_tmp1_q  <= tmp1_q;
             prev_ext0_q  <= ext0_q;
             prev_ext1_q  <= ext1_q;
-            for (idx = 0; idx < 8; idx = idx + 1) begin
+            for (idx = 0; idx < 5; idx = idx + 1) begin
                 prev_ram_q[idx] <= ram_q[idx];
             end
         end
@@ -281,7 +303,7 @@ module tt_um_kazan_rqpu (
             prev_tmp1_q  <= 4'h0;
             prev_ext0_q  <= 4'h0;
             prev_ext1_q  <= 4'h0;
-            for (idx = 0; idx < 8; idx = idx + 1) begin
+            for (idx = 0; idx < 5; idx = idx + 1) begin
                 prev_ram_q[idx] <= 4'h0;
             end
         end
@@ -314,7 +336,7 @@ module tt_um_kazan_rqpu (
             prev_ext0_q  <= ext0_q;
             prev_ext1_q  <= ext1_q;
 
-            for (idx = 0; idx < 8; idx = idx + 1) begin
+            for (idx = 0; idx < 5; idx = idx + 1) begin
                 ram_q[idx]      <= prev_ram_q[idx];
                 prev_ram_q[idx] <= ram_q[idx];
             end
@@ -335,7 +357,7 @@ module tt_um_kazan_rqpu (
             tmp1_q  <= 4'h0;
             ext0_q  <= 4'h0;
             ext1_q  <= 4'h0;
-            for (idx = 0; idx < 8; idx = idx + 1) begin
+            for (idx = 0; idx < 5; idx = idx + 1) begin
                 ram_q[idx] <= 4'h0;
             end
         end
@@ -403,7 +425,7 @@ module tt_um_kazan_rqpu (
             prev_tmp1_q  <= 4'h0;
             prev_ext0_q  <= 4'h0;
             prev_ext1_q  <= 4'h0;
-            for (i = 0; i < 8; i = i + 1) begin
+            for (i = 0; i < 5; i = i + 1) begin
                 ram_q[i]      <= 4'h0;
                 prev_ram_q[i] <= 4'h0;
             end
@@ -650,7 +672,7 @@ module tt_um_kazan_rqpu (
                                     if (ir_mode_q) begin
         tmp_data = sys_read(arg_a_q);
     end else begin
-        tmp_data = ram_q[arg_a_q[2:0]];
+        tmp_data = ram_q[ram_index(arg_a_q)];
     end
     mdr_q   <= tmp_data;
     out_q   <= tmp_data;
@@ -672,7 +694,7 @@ module tt_um_kazan_rqpu (
                                             flags_q <= flags_from_result(arg_b_q, 1'b0);
                                         end
                                     end else begin
-                                        ram_q[arg_a_q[2:0]] <= arg_b_q;
+                                        ram_q[ram_index(arg_a_q)] <= arg_b_q;
                                         mdr_q          <= arg_b_q;
                                         out_q          <= arg_b_q;
                                         flags_q        <= flags_from_result(arg_b_q, 1'b0);
@@ -683,7 +705,7 @@ module tt_um_kazan_rqpu (
                                     if (ir_mode_q) begin
         tmp_data = sys_read(arg_a_q);
     end else begin
-        tmp_data = ram_q[arg_a_q[2:0]];
+        tmp_data = ram_q[ram_index(arg_a_q)];
     end
     acc_q   <= tmp_data;
     mdr_q   <= tmp_data;
@@ -693,8 +715,8 @@ module tt_um_kazan_rqpu (
 
                                 default: begin // SWAPACC
                                     if (!ir_mode_q) begin
-                                        tmp_data      = ram_q[arg_a_q[2:0]];
-                                        ram_q[arg_a_q[2:0]] <= acc_q;
+                                        tmp_data      = ram_q[ram_index(arg_a_q)];
+                                        ram_q[ram_index(arg_a_q)] <= acc_q;
                                         acc_q         <= tmp_data;
                                         mdr_q         <= tmp_data;
                                         out_q         <= tmp_data;
