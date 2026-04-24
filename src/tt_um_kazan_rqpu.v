@@ -647,10 +647,14 @@ module tt_um_kazan_rqpu (
                             undo_valid_q <= 1'b1;
                             case (ir_func_q[1:0])
                                 2'd0: begin // READ
-                                    tmp_data = mapped_val_w;
-                                    mdr_q    <= tmp_data;
-                                    out_q    <= tmp_data;
-                                    flags_q  <= flags_from_result(tmp_data, 1'b0);
+                                    if (ir_mode_q) begin
+        tmp_data = sys_read(arg_a_q);
+    end else begin
+        tmp_data = ram_q[arg_a_q];
+    end
+    mdr_q   <= tmp_data;
+    out_q   <= tmp_data;
+    flags_q <= flags_from_result(tmp_data, 1'b0);
                                 end
 
                                 2'd1: begin // WRITE
@@ -676,11 +680,15 @@ module tt_um_kazan_rqpu (
                                 end
 
                                 2'd2: begin // LOADACC
-                                    tmp_data = mapped_val_w;
-                                    acc_q    <= tmp_data;
-                                    mdr_q    <= tmp_data;
-                                    out_q    <= tmp_data;
-                                    flags_q  <= flags_from_result(tmp_data, 1'b0);
+                                    if (ir_mode_q) begin
+        tmp_data = sys_read(arg_a_q);
+    end else begin
+        tmp_data = ram_q[arg_a_q];
+    end
+    acc_q   <= tmp_data;
+    mdr_q   <= tmp_data;
+    out_q   <= tmp_data;
+    flags_q <= flags_from_result(tmp_data, 1'b0);
                                 end
 
                                 default: begin // SWAPACC
