@@ -125,7 +125,7 @@ async def test_rqpu_v2_protocol_and_memory(dut):
     assert out["data"] == 0x6 and out["z"] == 0 and out["c"] == 0, out
 
     out = await issue(dut, CLS_REV, 0, REV_REVERSE, 0x0, 0x0)
-    assert out["data"] == 0x9 and out["z"] == 0 and out["c"] == 0, out
+    assert out["data"] == 0x6 and out["z"] == 0 and out["c"] == 0, out
 
     out = await issue(dut, CLS_MEM, 0, MEM_WRITE, 0x3, 0xC)
     assert out["data"] == 0xC and out["z"] == 0, out

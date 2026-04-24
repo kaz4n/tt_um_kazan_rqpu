@@ -19,8 +19,7 @@
  * - 4-phase deterministic controller protocol
  * - 4x4 scratchpad RAM implemented with registers
  * - Memory-mapped internal registers
- * - Undo/redo style REVERSE operation using current/previous architectural
- *   state swapping
+ * - Minimal metadata REVERSE operation for single-step undo
  * - uio_* intentionally unused
  */
 `default_nettype none
@@ -104,14 +103,11 @@ module tt_um_kazan_rqpu (
     reg [3:0] prev_breg_q;
     reg [3:0] prev_shd_q;
     reg [2:0] prev_flags_q;
-    reg [3:0] prev_mar_q;
-    reg [3:0] prev_mdr_q;
     reg [3:0] prev_out_q;
-    reg [3:0] prev_tmp0_q;
-    reg [3:0] prev_tmp1_q;
-    reg [3:0] prev_ext0_q;
-    reg [3:0] prev_ext1_q;
-    reg [3:0] prev_ram_q [0:3];
+    reg       undo_has_write_q;
+    reg       undo_write_mode_q; // 0: RAM, 1: SYS
+    reg [3:0] undo_write_addr_q;
+    reg [3:0] undo_write_data_q;
 
     integer i;
 
@@ -231,76 +227,48 @@ module tt_um_kazan_rqpu (
     // Snapshot helpers for REVERSE
     // ---------------------------------------------------------------------
     task snapshot_current_to_prev;
-        integer idx;
         begin
             prev_acc_q   <= acc_q;
             prev_breg_q  <= breg_q;
             prev_shd_q   <= shd_q;
             prev_flags_q <= flags_q;
-            prev_mar_q   <= mar_q;
-            prev_mdr_q   <= mdr_q;
             prev_out_q   <= out_q;
-            prev_tmp0_q  <= tmp0_q;
-            prev_tmp1_q  <= tmp1_q;
-            prev_ext0_q  <= ext0_q;
-            prev_ext1_q  <= ext1_q;
-            for (idx = 0; idx < 4; idx = idx + 1) begin
-                prev_ram_q[idx] <= ram_q[idx];
-            end
+            undo_has_write_q <= 1'b0;
         end
     endtask
 
     task clear_prev_snapshot;
-        integer idx;
         begin
             prev_acc_q   <= 4'h0;
             prev_breg_q  <= 4'h0;
             prev_shd_q   <= 4'h0;
             prev_flags_q <= 3'b000;
-            prev_mar_q   <= 4'h0;
-            prev_mdr_q   <= 4'h0;
             prev_out_q   <= 4'h0;
-            prev_tmp0_q  <= 4'h0;
-            prev_tmp1_q  <= 4'h0;
-            prev_ext0_q  <= 4'h0;
-            prev_ext1_q  <= 4'h0;
-            for (idx = 0; idx < 4; idx = idx + 1) begin
-                prev_ram_q[idx] <= 4'h0;
-            end
+            undo_has_write_q  <= 1'b0;
+            undo_write_mode_q <= 1'b0;
+            undo_write_addr_q <= 4'h0;
+            undo_write_data_q <= 4'h0;
         end
     endtask
 
     task swap_current_and_prev;
-        integer idx;
         begin
             acc_q        <= prev_acc_q;
             breg_q       <= prev_breg_q;
             shd_q        <= prev_shd_q;
             flags_q      <= prev_flags_q;
-            mar_q        <= prev_mar_q;
-            mdr_q        <= prev_mdr_q;
             out_q        <= prev_out_q;
-            tmp0_q       <= prev_tmp0_q;
-            tmp1_q       <= prev_tmp1_q;
-            ext0_q       <= prev_ext0_q;
-            ext1_q       <= prev_ext1_q;
 
-            prev_acc_q   <= acc_q;
-            prev_breg_q  <= breg_q;
-            prev_shd_q   <= shd_q;
-            prev_flags_q <= flags_q;
-            prev_mar_q   <= mar_q;
-            prev_mdr_q   <= mdr_q;
-            prev_out_q   <= out_q;
-            prev_tmp0_q  <= tmp0_q;
-            prev_tmp1_q  <= tmp1_q;
-            prev_ext0_q  <= ext0_q;
-            prev_ext1_q  <= ext1_q;
-
-            for (idx = 0; idx < 4; idx = idx + 1) begin
-                ram_q[idx]      <= prev_ram_q[idx];
-                prev_ram_q[idx] <= ram_q[idx];
+            if (undo_has_write_q) begin
+                if (!undo_write_mode_q) begin
+                    ram_q[undo_write_addr_q[1:0]] <= undo_write_data_q;
+                end else if (is_writable_sys_addr(undo_write_addr_q)) begin
+                    write_current_sys_reg(undo_write_addr_q, undo_write_data_q);
+                end
             end
+
+            undo_valid_q <= 1'b0;
+            undo_has_write_q <= 1'b0;
         end
     endtask
 
@@ -379,16 +347,13 @@ module tt_um_kazan_rqpu (
             prev_breg_q  <= 4'h0;
             prev_shd_q   <= 4'h0;
             prev_flags_q <= 3'b000;
-            prev_mar_q   <= 4'h0;
-            prev_mdr_q   <= 4'h0;
             prev_out_q   <= 4'h0;
-            prev_tmp0_q  <= 4'h0;
-            prev_tmp1_q  <= 4'h0;
-            prev_ext0_q  <= 4'h0;
-            prev_ext1_q  <= 4'h0;
+            undo_has_write_q  <= 1'b0;
+            undo_write_mode_q <= 1'b0;
+            undo_write_addr_q <= 4'h0;
+            undo_write_data_q <= 4'h0;
             for (i = 0; i < 4; i = i + 1) begin
-                ram_q[i]      <= 4'h0;
-                prev_ram_q[i] <= 4'h0;
+                ram_q[i] <= 4'h0;
             end
         end else if (ena) begin
             case (phase_q)
@@ -639,6 +604,10 @@ module tt_um_kazan_rqpu (
                                 2'd1: begin // WRITE
                                     if (ir_mode_q) begin
                                         if (is_writable_sys_addr(arg_a_q)) begin
+                                            undo_has_write_q  <= 1'b1;
+                                            undo_write_mode_q <= 1'b1;
+                                            undo_write_addr_q <= arg_a_q;
+                                            undo_write_data_q <= sys_read(arg_a_q);
                                             write_current_sys_reg(arg_a_q, arg_b_q);
                                         end
                                         if (arg_a_q == SYS_FLAGS) begin
@@ -651,6 +620,10 @@ module tt_um_kazan_rqpu (
                                             flags_q <= flags_from_result(arg_b_q, 1'b0);
                                         end
                                     end else begin
+                                        undo_has_write_q  <= 1'b1;
+                                        undo_write_mode_q <= 1'b0;
+                                        undo_write_addr_q <= arg_a_q;
+                                        undo_write_data_q <= ram_q[arg_a_q[1:0]];
                                         ram_q[arg_a_q[1:0]] <= arg_b_q;
                                         mdr_q          <= arg_b_q;
                                         out_q          <= arg_b_q;
@@ -668,14 +641,22 @@ module tt_um_kazan_rqpu (
 
                                 default: begin // SWAPACC
                                     if (!ir_mode_q) begin
+                                        undo_has_write_q  <= 1'b1;
+                                        undo_write_mode_q <= 1'b0;
+                                        undo_write_addr_q <= arg_a_q;
                                         tmp_data      = ram_q[arg_a_q[1:0]];
+                                        undo_write_data_q <= tmp_data;
                                         ram_q[arg_a_q[1:0]] <= acc_q;
                                         acc_q         <= tmp_data;
                                         mdr_q         <= tmp_data;
                                         out_q         <= tmp_data;
                                         flags_q       <= flags_from_result(tmp_data, 1'b0);
                                     end else if (is_gp_sys_addr(arg_a_q)) begin
+                                        undo_has_write_q  <= 1'b1;
+                                        undo_write_mode_q <= 1'b1;
+                                        undo_write_addr_q <= arg_a_q;
                                         tmp_data = sys_read(arg_a_q);
+                                        undo_write_data_q <= tmp_data;
                                         write_current_sys_reg(arg_a_q, acc_q);
                                         acc_q    <= tmp_data;
                                         mdr_q    <= tmp_data;
@@ -696,6 +677,10 @@ module tt_um_kazan_rqpu (
                                 2'd0: begin // MOV sys[B] <= sys[A]
                                     if (is_gp_sys_addr(arg_b_q)) begin
                                         tmp_data = sys_a_val_w;
+                                        undo_has_write_q  <= 1'b1;
+                                        undo_write_mode_q <= 1'b1;
+                                        undo_write_addr_q <= arg_b_q;
+                                        undo_write_data_q <= sys_b_val_w;
                                         write_current_sys_reg(arg_b_q, tmp_data);
                                         out_q   <= tmp_data;
                                         flags_q <= flags_from_result(tmp_data, 1'b0);
@@ -706,6 +691,10 @@ module tt_um_kazan_rqpu (
                                     if (is_gp_sys_addr(arg_a_q) && is_gp_sys_addr(arg_b_q)) begin
                                         tmp_data   = sys_a_val_w;
                                         tmp_data_b = sys_b_val_w;
+                                        undo_has_write_q  <= 1'b1;
+                                        undo_write_mode_q <= 1'b1;
+                                        undo_write_addr_q <= arg_b_q;
+                                        undo_write_data_q <= tmp_data_b;
                                         write_current_sys_reg(arg_a_q, tmp_data_b);
                                         write_current_sys_reg(arg_b_q, tmp_data);
                                         out_q   <= tmp_data_b;
@@ -715,6 +704,10 @@ module tt_um_kazan_rqpu (
 
                                 2'd2: begin // CLEAR sys[A]
                                     if (is_gp_sys_addr(arg_a_q) || (arg_a_q == SYS_OUT)) begin
+                                        undo_has_write_q  <= 1'b1;
+                                        undo_write_mode_q <= 1'b1;
+                                        undo_write_addr_q <= arg_a_q;
+                                        undo_write_data_q <= sys_a_val_w;
                                         write_current_sys_reg(arg_a_q, 4'h0);
                                         out_q   <= 4'h0;
                                         flags_q <= flags_from_result(4'h0, 1'b0);
@@ -723,6 +716,10 @@ module tt_um_kazan_rqpu (
 
                                 default: begin // LOADIMM sys[A] <= B
                                     if (is_gp_sys_addr(arg_a_q) || (arg_a_q == SYS_OUT)) begin
+                                        undo_has_write_q  <= 1'b1;
+                                        undo_write_mode_q <= 1'b1;
+                                        undo_write_addr_q <= arg_a_q;
+                                        undo_write_data_q <= sys_a_val_w;
                                         write_current_sys_reg(arg_a_q, arg_b_q);
                                         out_q   <= arg_b_q;
                                         flags_q <= flags_from_result(arg_b_q, 1'b0);

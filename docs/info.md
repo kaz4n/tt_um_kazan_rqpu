@@ -27,7 +27,7 @@ The core includes:
 - 4x4 on-chip scratchpad RAM (`RAM[0:3]`)
 - memory-mapped internal registers (`ACC`, `BREG`, `SHD`, `FLAGS`, `MAR`, `MDR`, `OUT`, `TMP0`, `TMP1`, `EXT0`, `EXT1`, and previous-state mirrors)
 
-The reversible behavior uses snapshot and swap logic so `REVERSE` can undo/redo recent architectural changes.
+The reversible behavior uses compact checkpoint metadata so `REVERSE` performs a single-step undo of recent architectural changes.
 
 ## How to test
 
