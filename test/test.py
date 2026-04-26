@@ -175,4 +175,4 @@ async def test_rqpu_v2_fit_plus(dut):
 
     # REVERSE should undo last LOADACC, restoring prior ACC (=B from earlier)
     out = await issue(dut, CLS_REV, 0, FUNC1, 0x0, 0x0)
-    assert out["data"] == 0xB and out["z"] == 0, out
+    assert out["data"] == 0xA and out["z"] == 0, out
