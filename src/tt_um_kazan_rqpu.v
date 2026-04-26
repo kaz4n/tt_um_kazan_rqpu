@@ -1,7 +1,7 @@
 /*
  * SPDX-License-Identifier: Apache-2.0
  *
- * RQPU v2-fit: area-reduced reversible-computing-inspired 4-bit core for Tiny Tapeout.
+ * RQPU v2-fit+: compact reversible-computing-inspired 4-bit core for Tiny Tapeout.
  *
  * Public bus contract:
  *   uo_out[7:6] = phase[1:0]
@@ -20,6 +20,14 @@
  *   - 4x4 scratchpad RAM
  *   - single-step checkpoint / undo
  *   - no uio usage
+ *
+ * Restored functionality pack:
+ *   ALU mode=0: ADD / XOR / AND / OR
+ *   ALU mode=1: SUB / XNOR / NAND / NOR
+ *   PERM mode=0: ROL / ROR / SWAP2 / BITREV
+ *   PERM mode=1: SHL / SHR / GRAYENC / GRAYDEC
+ *   CTRL func=2: CMP emits {0,GT,EQ,LT} on OUT, with Z=EQ and C=GT
+ *   REV  func=3: PARITY/ECC emits {p4,p2,p1,p0}
  */
 `default_nettype none
 
@@ -42,12 +50,12 @@ module tt_um_kazan_rqpu (
     localparam [1:0] P3_OUTPUT  = 2'b11;
 
     // ---------------------------------------------------------------------
-    // Reduced class map (v2-fit)
+    // Reduced class map (v2-fit+)
     // ---------------------------------------------------------------------
-    localparam [2:0] CLS_ALU   = 3'b000; // ADD/XOR/AND/OR
-    localparam [2:0] CLS_PERM  = 3'b001; // ROL/ROR/SWAP2/BITREV
+    localparam [2:0] CLS_ALU   = 3'b000; // mode 0: ADD/XOR/AND/OR, mode 1: SUB/XNOR/NAND/NOR
+    localparam [2:0] CLS_PERM  = 3'b001; // mode 0: ROL/ROR/SWAP2/BITREV, mode 1: SHL/SHR/GRAYENC/GRAYDEC
     localparam [2:0] CLS_MEM   = 3'b010; // READ/WRITE/LOADACC/SWAPACC
-    localparam [2:0] CLS_REV   = 3'b011; // SAVE/REVERSE/ACC<->SHD/PARITY
+    localparam [2:0] CLS_REV   = 3'b011; // SAVE/REVERSE/ACC<->SHD/PARITY+ECC
     localparam [2:0] CLS_CTRL  = 3'b100; // SETACC/SETSHD/CMP/CLEAR
     // 101/110/111 reserved as NOPs
 
@@ -86,7 +94,7 @@ module tt_um_kazan_rqpu (
     reg       prev_c_q;
     reg       undo_valid_q;
     reg       undo_write_valid_q;
-    reg       undo_write_mode_q;    // 0 = RAM, 1 = SYS
+    reg       undo_write_mode_q;    // kept for compatibility with earlier v2 docs; only RAM writes are tracked
     reg [1:0] undo_write_addr_q;
     reg [3:0] undo_write_olddata_q;
 
@@ -109,10 +117,38 @@ module tt_um_kazan_rqpu (
         end
     endfunction
 
-    function [3:0] parity4;
+    function [3:0] grayenc4;
         input [3:0] value;
         begin
-            parity4 = {3'b000, ^value};
+            grayenc4 = {value[3], value[3]^value[2], value[2]^value[1], value[1]^value[0]};
+        end
+    endfunction
+
+    function [3:0] graydec4;
+        input [3:0] value;
+        begin
+            graydec4[3] = value[3];
+            graydec4[2] = value[3] ^ value[2];
+            graydec4[1] = value[3] ^ value[2] ^ value[1];
+            graydec4[0] = value[3] ^ value[2] ^ value[1] ^ value[0];
+        end
+    endfunction
+
+    // Emit a compact parity-plus-Hamming nibble.
+    // p1/p2/p4 are Hamming-style check bits for the 4-bit data nibble.
+    // p0 is the overall data parity bit.
+    function [3:0] ecc4;
+        input [3:0] value;
+        reg p0;
+        reg p1;
+        reg p2;
+        reg p4;
+        begin
+            p0 = value[3] ^ value[2] ^ value[1] ^ value[0];
+            p1 = value[0] ^ value[1] ^ value[3];
+            p2 = value[0] ^ value[2] ^ value[3];
+            p4 = value[1] ^ value[2] ^ value[3];
+            ecc4 = {p4, p2, p1, p0};
         end
     endfunction
 
@@ -211,6 +247,10 @@ module tt_um_kazan_rqpu (
         reg [3:0] tmp_data;
         reg [3:0] old_mapped;
         reg [1:0] a2;
+        reg gt_cmp;
+        reg eq_cmp;
+        reg lt_cmp;
+        reg no_borrow;
         if (!rst_n) begin
             phase_q <= P0_INSTR;
             ir_class_q <= 3'b000;
@@ -241,6 +281,9 @@ module tt_um_kazan_rqpu (
             end
         end else if (ena) begin
             a2 = arg_a_q[1:0];
+            gt_cmp = (acc_q > arg_b_q);
+            eq_cmp = (acc_q == arg_b_q);
+            lt_cmp = (acc_q < arg_b_q);
             case (phase_q)
                 P0_INSTR: begin
                     ir_class_q <= ui_in[7:5];
@@ -261,76 +304,147 @@ module tt_um_kazan_rqpu (
                     case (ir_class_q)
                         // -------------------------------------------------
                         // 000: ALU family (use arg_b_q as immediate source)
+                        // mode=0: ADD/XOR/AND/OR
+                        // mode=1: SUB/XNOR/NAND/NOR
                         // -------------------------------------------------
                         CLS_ALU: begin
                             checkpoint_no_write();
-                            case (ir_func_q[1:0])
-                                2'b00: begin // ADD
-                                    ext5 = {1'b0, acc_q} + {1'b0, arg_b_q};
-                                    acc_q <= ext5[3:0];
-                                    out_q <= ext5[3:0];
-                                    z_q   <= (ext5[3:0] == 4'h0);
-                                    c_q   <= ext5[4];
-                                end
-                                2'b01: begin // XOR
-                                    tmp_data = acc_q ^ arg_b_q;
-                                    acc_q <= tmp_data;
-                                    out_q <= tmp_data;
-                                    z_q   <= (tmp_data == 4'h0);
-                                    c_q   <= 1'b0;
-                                end
-                                2'b10: begin // AND
-                                    tmp_data = acc_q & arg_b_q;
-                                    acc_q <= tmp_data;
-                                    out_q <= tmp_data;
-                                    z_q   <= (tmp_data == 4'h0);
-                                    c_q   <= 1'b0;
-                                end
-                                default: begin // OR
-                                    tmp_data = acc_q | arg_b_q;
-                                    acc_q <= tmp_data;
-                                    out_q <= tmp_data;
-                                    z_q   <= (tmp_data == 4'h0);
-                                    c_q   <= 1'b0;
-                                end
-                            endcase
+                            if (!ir_mode_q) begin
+                                case (ir_func_q[1:0])
+                                    2'b00: begin // ADD
+                                        ext5 = {1'b0, acc_q} + {1'b0, arg_b_q};
+                                        acc_q <= ext5[3:0];
+                                        out_q <= ext5[3:0];
+                                        z_q   <= (ext5[3:0] == 4'h0);
+                                        c_q   <= ext5[4];
+                                    end
+                                    2'b01: begin // XOR
+                                        tmp_data = acc_q ^ arg_b_q;
+                                        acc_q <= tmp_data;
+                                        out_q <= tmp_data;
+                                        z_q   <= (tmp_data == 4'h0);
+                                        c_q   <= 1'b0;
+                                    end
+                                    2'b10: begin // AND
+                                        tmp_data = acc_q & arg_b_q;
+                                        acc_q <= tmp_data;
+                                        out_q <= tmp_data;
+                                        z_q   <= (tmp_data == 4'h0);
+                                        c_q   <= 1'b0;
+                                    end
+                                    default: begin // OR
+                                        tmp_data = acc_q | arg_b_q;
+                                        acc_q <= tmp_data;
+                                        out_q <= tmp_data;
+                                        z_q   <= (tmp_data == 4'h0);
+                                        c_q   <= 1'b0;
+                                    end
+                                endcase
+                            end else begin
+                                case (ir_func_q[1:0])
+                                    2'b00: begin // SUB
+                                        tmp_data = acc_q - arg_b_q;
+                                        no_borrow = (acc_q >= arg_b_q);
+                                        acc_q <= tmp_data;
+                                        out_q <= tmp_data;
+                                        z_q   <= (tmp_data == 4'h0);
+                                        c_q   <= no_borrow;
+                                    end
+                                    2'b01: begin // XNOR
+                                        tmp_data = ~(acc_q ^ arg_b_q);
+                                        acc_q <= tmp_data;
+                                        out_q <= tmp_data;
+                                        z_q   <= (tmp_data == 4'h0);
+                                        c_q   <= 1'b0;
+                                    end
+                                    2'b10: begin // NAND
+                                        tmp_data = ~(acc_q & arg_b_q);
+                                        acc_q <= tmp_data;
+                                        out_q <= tmp_data;
+                                        z_q   <= (tmp_data == 4'h0);
+                                        c_q   <= 1'b0;
+                                    end
+                                    default: begin // NOR
+                                        tmp_data = ~(acc_q | arg_b_q);
+                                        acc_q <= tmp_data;
+                                        out_q <= tmp_data;
+                                        z_q   <= (tmp_data == 4'h0);
+                                        c_q   <= 1'b0;
+                                    end
+                                endcase
+                            end
                         end
 
                         // -------------------------------------------------
-                        // 001: Permute family
+                        // 001: Permute / encode family
+                        // mode=0: ROL/ROR/SWAP2/BITREV
+                        // mode=1: SHL/SHR/GRAYENC/GRAYDEC
                         // -------------------------------------------------
                         CLS_PERM: begin
                             checkpoint_no_write();
-                            case (ir_func_q[1:0])
-                                2'b00: begin // ROL
-                                    tmp_data = {acc_q[2:0], acc_q[3]};
-                                    acc_q <= tmp_data;
-                                    out_q <= tmp_data;
-                                    z_q   <= (tmp_data == 4'h0);
-                                    c_q   <= acc_q[3];
-                                end
-                                2'b01: begin // ROR
-                                    tmp_data = {acc_q[0], acc_q[3:1]};
-                                    acc_q <= tmp_data;
-                                    out_q <= tmp_data;
-                                    z_q   <= (tmp_data == 4'h0);
-                                    c_q   <= acc_q[0];
-                                end
-                                2'b10: begin // SWAP2
-                                    tmp_data = swap2_4(acc_q);
-                                    acc_q <= tmp_data;
-                                    out_q <= tmp_data;
-                                    z_q   <= (tmp_data == 4'h0);
-                                    c_q   <= 1'b0;
-                                end
-                                default: begin // BITREV
-                                    tmp_data = bitrev4(acc_q);
-                                    acc_q <= tmp_data;
-                                    out_q <= tmp_data;
-                                    z_q   <= (tmp_data == 4'h0);
-                                    c_q   <= 1'b0;
-                                end
-                            endcase
+                            if (!ir_mode_q) begin
+                                case (ir_func_q[1:0])
+                                    2'b00: begin // ROL
+                                        tmp_data = {acc_q[2:0], acc_q[3]};
+                                        acc_q <= tmp_data;
+                                        out_q <= tmp_data;
+                                        z_q   <= (tmp_data == 4'h0);
+                                        c_q   <= acc_q[3];
+                                    end
+                                    2'b01: begin // ROR
+                                        tmp_data = {acc_q[0], acc_q[3:1]};
+                                        acc_q <= tmp_data;
+                                        out_q <= tmp_data;
+                                        z_q   <= (tmp_data == 4'h0);
+                                        c_q   <= acc_q[0];
+                                    end
+                                    2'b10: begin // SWAP2
+                                        tmp_data = swap2_4(acc_q);
+                                        acc_q <= tmp_data;
+                                        out_q <= tmp_data;
+                                        z_q   <= (tmp_data == 4'h0);
+                                        c_q   <= 1'b0;
+                                    end
+                                    default: begin // BITREV
+                                        tmp_data = bitrev4(acc_q);
+                                        acc_q <= tmp_data;
+                                        out_q <= tmp_data;
+                                        z_q   <= (tmp_data == 4'h0);
+                                        c_q   <= 1'b0;
+                                    end
+                                endcase
+                            end else begin
+                                case (ir_func_q[1:0])
+                                    2'b00: begin // SHL
+                                        tmp_data = {acc_q[2:0], 1'b0};
+                                        acc_q <= tmp_data;
+                                        out_q <= tmp_data;
+                                        z_q   <= (tmp_data == 4'h0);
+                                        c_q   <= acc_q[3];
+                                    end
+                                    2'b01: begin // SHR
+                                        tmp_data = {1'b0, acc_q[3:1]};
+                                        acc_q <= tmp_data;
+                                        out_q <= tmp_data;
+                                        z_q   <= (tmp_data == 4'h0);
+                                        c_q   <= acc_q[0];
+                                    end
+                                    2'b10: begin // GRAYENC
+                                        tmp_data = grayenc4(acc_q);
+                                        acc_q <= tmp_data;
+                                        out_q <= tmp_data;
+                                        z_q   <= (tmp_data == 4'h0);
+                                        c_q   <= 1'b0;
+                                    end
+                                    default: begin // GRAYDEC
+                                        tmp_data = graydec4(acc_q);
+                                        acc_q <= tmp_data;
+                                        out_q <= tmp_data;
+                                        z_q   <= (tmp_data == 4'h0);
+                                        c_q   <= 1'b0;
+                                    end
+                                endcase
+                            end
                         end
 
                         // -------------------------------------------------
@@ -435,11 +549,11 @@ module tt_um_kazan_rqpu (
                                     c_q   <= 1'b0;
                                 end
 
-                                default: begin // PARITY
-                                    tmp_data = parity4(acc_q);
+                                default: begin // PARITY / ECC nibble
+                                    tmp_data = ecc4(acc_q);
                                     out_q <= tmp_data;
                                     z_q   <= (tmp_data == 4'h0);
-                                    c_q   <= 1'b0;
+                                    c_q   <= tmp_data[0];
                                 end
                             endcase
                         end
@@ -463,10 +577,10 @@ module tt_um_kazan_rqpu (
                                     z_q   <= (arg_b_q == 4'h0);
                                     c_q   <= 1'b0;
                                 end
-                                2'b10: begin // CMP flags
-                                    out_q <= {2'b00, (acc_q > arg_b_q), (acc_q == arg_b_q)};
-                                    z_q   <= (acc_q == arg_b_q);
-                                    c_q   <= (acc_q >= arg_b_q);
+                                2'b10: begin // CMP => OUT={0,GT,EQ,LT}, Z=EQ, C=GT
+                                    out_q <= {1'b0, gt_cmp, eq_cmp, lt_cmp};
+                                    z_q   <= eq_cmp;
+                                    c_q   <= gt_cmp;
                                 end
                                 default: begin // CLEAR working state (not RAM)
                                     checkpoint_no_write();
