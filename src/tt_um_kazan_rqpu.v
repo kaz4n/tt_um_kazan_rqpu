@@ -1,7 +1,7 @@
 /*
  * SPDX-License-Identifier: Apache-2.0
  *
- * RQPU v2-fit+: compact reversible-computing-inspired 4-bit core for Tiny Tapeout.
+ * RQPU v2-fit+ with BREG-lite: compact reversible-computing-inspired 4-bit core for Tiny Tapeout.
  *
  * Public bus contract:
  *   uo_out[7:6] = phase[1:0]
@@ -16,18 +16,26 @@
  *   P3 (11): outputs valid
  *
  * Area-reduced architectural state:
- *   - ACC, SHD, OUT, Z, C
+ *   - ACC, hidden BREG-lite, SHD, OUT, Z, C
  *   - 4x4 scratchpad RAM
  *   - single-step checkpoint / undo
  *   - no uio usage
  *
- * Restored functionality pack:
- *   ALU mode=0: ADD / XOR / AND / OR
- *   ALU mode=1: SUB / XNOR / NAND / NOR
+ * Live functionality packs:
+ *   ALU  mode=0: ADD / XOR / AND / OR
+ *   ALU  mode=1: SUB / XNOR / NAND / NOR
  *   PERM mode=0: ROL / ROR / SWAP2 / BITREV
  *   PERM mode=1: SHL / SHR / GRAYENC / GRAYDEC
- *   CTRL func=2: CMP emits {0,GT,EQ,LT} on OUT, with Z=EQ and C=GT
- *   REV  func=3: PARITY/ECC emits {p4,p2,p1,p0}
+ *   MEM         : READ / WRITE / LOADACC / SWAPACC
+ *   REV  mode=0: SAVE / REVERSE / ACC<->SHD  / PARITY+ECC
+ *   REV  mode=1: SAVE / REVERSE / ACC<->BREG / PARITY+ECC
+ *   CTRL mode=0: SETACC / SETSHD / CMP / CLEAR
+ *   CTRL mode=1: SETBREG / reserved / reserved / reserved
+ *
+ * BREG-lite notes:
+ *   - Hidden internal register, not memory-mapped
+ *   - Restored with REVERSE via prev_breg_q
+ *   - ALU rhs select uses A[0]: 0 => immediate B, 1 => BREG
  */
 `default_nettype none
 
@@ -50,13 +58,13 @@ module tt_um_kazan_rqpu (
     localparam [1:0] P3_OUTPUT  = 2'b11;
 
     // ---------------------------------------------------------------------
-    // Reduced class map (v2-fit+)
+    // Class map
     // ---------------------------------------------------------------------
-    localparam [2:0] CLS_ALU   = 3'b000; // mode 0: ADD/XOR/AND/OR, mode 1: SUB/XNOR/NAND/NOR
-    localparam [2:0] CLS_PERM  = 3'b001; // mode 0: ROL/ROR/SWAP2/BITREV, mode 1: SHL/SHR/GRAYENC/GRAYDEC
-    localparam [2:0] CLS_MEM   = 3'b010; // READ/WRITE/LOADACC/SWAPACC
-    localparam [2:0] CLS_REV   = 3'b011; // SAVE/REVERSE/ACC<->SHD/PARITY+ECC
-    localparam [2:0] CLS_CTRL  = 3'b100; // SETACC/SETSHD/CMP/CLEAR
+    localparam [2:0] CLS_ALU   = 3'b000;
+    localparam [2:0] CLS_PERM  = 3'b001;
+    localparam [2:0] CLS_MEM   = 3'b010;
+    localparam [2:0] CLS_REV   = 3'b011;
+    localparam [2:0] CLS_CTRL  = 3'b100;
     // 101/110/111 reserved as NOPs
 
     // ---------------------------------------------------------------------
@@ -79,6 +87,7 @@ module tt_um_kazan_rqpu (
     reg [3:0] arg_b_q;
 
     reg [3:0] acc_q;
+    reg [3:0] breg_q;
     reg [3:0] shd_q;
     reg [3:0] out_q;
     reg       z_q;
@@ -88,13 +97,14 @@ module tt_um_kazan_rqpu (
 
     // Undo / checkpoint state
     reg [3:0] prev_acc_q;
+    reg [3:0] prev_breg_q;
     reg [3:0] prev_shd_q;
     reg [3:0] prev_out_q;
     reg       prev_z_q;
     reg       prev_c_q;
     reg       undo_valid_q;
     reg       undo_write_valid_q;
-    reg       undo_write_mode_q;    // kept for compatibility with earlier v2 docs; only RAM writes are tracked
+    reg       undo_write_mode_q;    // kept for compatibility; only RAM writes are tracked
     reg [1:0] undo_write_addr_q;
     reg [3:0] undo_write_olddata_q;
 
@@ -135,8 +145,6 @@ module tt_um_kazan_rqpu (
     endfunction
 
     // Emit a compact parity-plus-Hamming nibble.
-    // p1/p2/p4 are Hamming-style check bits for the 4-bit data nibble.
-    // p0 is the overall data parity bit.
     function [3:0] ecc4;
         input [3:0] value;
         reg p0;
@@ -186,15 +194,16 @@ module tt_um_kazan_rqpu (
 
     task checkpoint_no_write;
         begin
-            prev_acc_q        <= acc_q;
-            prev_shd_q        <= shd_q;
-            prev_out_q        <= out_q;
-            prev_z_q          <= z_q;
-            prev_c_q          <= c_q;
-            undo_valid_q      <= 1'b1;
-            undo_write_valid_q<= 1'b0;
-            undo_write_mode_q <= 1'b0;
-            undo_write_addr_q <= 2'b00;
+            prev_acc_q           <= acc_q;
+            prev_breg_q          <= breg_q;
+            prev_shd_q           <= shd_q;
+            prev_out_q           <= out_q;
+            prev_z_q             <= z_q;
+            prev_c_q             <= c_q;
+            undo_valid_q         <= 1'b1;
+            undo_write_valid_q   <= 1'b0;
+            undo_write_mode_q    <= 1'b0;
+            undo_write_addr_q    <= 2'b00;
             undo_write_olddata_q <= 4'h0;
         end
     endtask
@@ -203,15 +212,16 @@ module tt_um_kazan_rqpu (
         input [1:0] addr;
         input [3:0] olddata;
         begin
-            prev_acc_q        <= acc_q;
-            prev_shd_q        <= shd_q;
-            prev_out_q        <= out_q;
-            prev_z_q          <= z_q;
-            prev_c_q          <= c_q;
-            undo_valid_q      <= 1'b1;
-            undo_write_valid_q<= 1'b1;
-            undo_write_mode_q <= 1'b0;
-            undo_write_addr_q <= addr;
+            prev_acc_q           <= acc_q;
+            prev_breg_q          <= breg_q;
+            prev_shd_q           <= shd_q;
+            prev_out_q           <= out_q;
+            prev_z_q             <= z_q;
+            prev_c_q             <= c_q;
+            undo_valid_q         <= 1'b1;
+            undo_write_valid_q   <= 1'b1;
+            undo_write_mode_q    <= 1'b0;
+            undo_write_addr_q    <= addr;
             undo_write_olddata_q <= olddata;
         end
     endtask
@@ -246,6 +256,7 @@ module tt_um_kazan_rqpu (
         reg [4:0] ext5;
         reg [3:0] tmp_data;
         reg [3:0] old_mapped;
+        reg [3:0] alu_rhs;
         reg [1:0] a2;
         reg gt_cmp;
         reg eq_cmp;
@@ -259,13 +270,15 @@ module tt_um_kazan_rqpu (
             arg_a_q    <= 4'h0;
             arg_b_q    <= 4'h0;
 
-            acc_q <= 4'h0;
-            shd_q <= 4'h0;
-            out_q <= 4'h0;
-            z_q   <= 1'b0;
-            c_q   <= 1'b0;
+            acc_q  <= 4'h0;
+            breg_q <= 4'h0;
+            shd_q  <= 4'h0;
+            out_q  <= 4'h0;
+            z_q    <= 1'b0;
+            c_q    <= 1'b0;
 
             prev_acc_q <= 4'h0;
+            prev_breg_q <= 4'h0;
             prev_shd_q <= 4'h0;
             prev_out_q <= 4'h0;
             prev_z_q   <= 1'b0;
@@ -280,10 +293,11 @@ module tt_um_kazan_rqpu (
                 ram_q[i] <= 4'h0;
             end
         end else if (ena) begin
-            a2 = arg_a_q[1:0];
-            gt_cmp = (acc_q > arg_b_q);
-            eq_cmp = (acc_q == arg_b_q);
-            lt_cmp = (acc_q < arg_b_q);
+            a2      = arg_a_q[1:0];
+            alu_rhs = arg_a_q[0] ? breg_q : arg_b_q;
+            gt_cmp  = (acc_q > arg_b_q);
+            eq_cmp  = (acc_q == arg_b_q);
+            lt_cmp  = (acc_q < arg_b_q);
             case (phase_q)
                 P0_INSTR: begin
                     ir_class_q <= ui_in[7:5];
@@ -303,37 +317,38 @@ module tt_um_kazan_rqpu (
 
                     case (ir_class_q)
                         // -------------------------------------------------
-                        // 000: ALU family (use arg_b_q as immediate source)
+                        // 000: ALU family
                         // mode=0: ADD/XOR/AND/OR
                         // mode=1: SUB/XNOR/NAND/NOR
+                        // rhs source: A[0]=0 => immediate B, A[0]=1 => BREG
                         // -------------------------------------------------
                         CLS_ALU: begin
                             checkpoint_no_write();
                             if (!ir_mode_q) begin
                                 case (ir_func_q[1:0])
                                     2'b00: begin // ADD
-                                        ext5 = {1'b0, acc_q} + {1'b0, arg_b_q};
+                                        ext5 = {1'b0, acc_q} + {1'b0, alu_rhs};
                                         acc_q <= ext5[3:0];
                                         out_q <= ext5[3:0];
                                         z_q   <= (ext5[3:0] == 4'h0);
                                         c_q   <= ext5[4];
                                     end
                                     2'b01: begin // XOR
-                                        tmp_data = acc_q ^ arg_b_q;
+                                        tmp_data = acc_q ^ alu_rhs;
                                         acc_q <= tmp_data;
                                         out_q <= tmp_data;
                                         z_q   <= (tmp_data == 4'h0);
                                         c_q   <= 1'b0;
                                     end
                                     2'b10: begin // AND
-                                        tmp_data = acc_q & arg_b_q;
+                                        tmp_data = acc_q & alu_rhs;
                                         acc_q <= tmp_data;
                                         out_q <= tmp_data;
                                         z_q   <= (tmp_data == 4'h0);
                                         c_q   <= 1'b0;
                                     end
                                     default: begin // OR
-                                        tmp_data = acc_q | arg_b_q;
+                                        tmp_data = acc_q | alu_rhs;
                                         acc_q <= tmp_data;
                                         out_q <= tmp_data;
                                         z_q   <= (tmp_data == 4'h0);
@@ -343,29 +358,29 @@ module tt_um_kazan_rqpu (
                             end else begin
                                 case (ir_func_q[1:0])
                                     2'b00: begin // SUB
-                                        tmp_data = acc_q - arg_b_q;
-                                        no_borrow = (acc_q >= arg_b_q);
+                                        tmp_data = acc_q - alu_rhs;
+                                        no_borrow = (acc_q >= alu_rhs);
                                         acc_q <= tmp_data;
                                         out_q <= tmp_data;
                                         z_q   <= (tmp_data == 4'h0);
                                         c_q   <= no_borrow;
                                     end
                                     2'b01: begin // XNOR
-                                        tmp_data = ~(acc_q ^ arg_b_q);
+                                        tmp_data = ~(acc_q ^ alu_rhs);
                                         acc_q <= tmp_data;
                                         out_q <= tmp_data;
                                         z_q   <= (tmp_data == 4'h0);
                                         c_q   <= 1'b0;
                                     end
                                     2'b10: begin // NAND
-                                        tmp_data = ~(acc_q & arg_b_q);
+                                        tmp_data = ~(acc_q & alu_rhs);
                                         acc_q <= tmp_data;
                                         out_q <= tmp_data;
                                         z_q   <= (tmp_data == 4'h0);
                                         c_q   <= 1'b0;
                                     end
                                     default: begin // NOR
-                                        tmp_data = ~(acc_q | arg_b_q);
+                                        tmp_data = ~(acc_q | alu_rhs);
                                         acc_q <= tmp_data;
                                         out_q <= tmp_data;
                                         z_q   <= (tmp_data == 4'h0);
@@ -511,6 +526,8 @@ module tt_um_kazan_rqpu (
 
                         // -------------------------------------------------
                         // 011: Reversible family
+                        // mode=0 func2 => ACC<->SHD
+                        // mode=1 func2 => ACC<->BREG
                         // -------------------------------------------------
                         CLS_REV: begin
                             case (ir_func_q[1:0])
@@ -527,6 +544,7 @@ module tt_um_kazan_rqpu (
                                             ram_q[undo_write_addr_q] <= undo_write_olddata_q;
                                         end
                                         acc_q <= prev_acc_q;
+                                        breg_q <= prev_breg_q;
                                         shd_q <= prev_shd_q;
                                         out_q <= prev_out_q;
                                         z_q   <= prev_z_q;
@@ -540,13 +558,21 @@ module tt_um_kazan_rqpu (
                                     end
                                 end
 
-                                2'b10: begin // ACC <-> SHD
+                                2'b10: begin // ACC <-> SHD or ACC <-> BREG
                                     checkpoint_no_write();
-                                    acc_q <= shd_q;
-                                    shd_q <= acc_q;
-                                    out_q <= shd_q;
-                                    z_q   <= (shd_q == 4'h0);
-                                    c_q   <= 1'b0;
+                                    if (!ir_mode_q) begin
+                                        acc_q <= shd_q;
+                                        shd_q <= acc_q;
+                                        out_q <= shd_q;
+                                        z_q   <= (shd_q == 4'h0);
+                                        c_q   <= 1'b0;
+                                    end else begin
+                                        acc_q <= breg_q;
+                                        breg_q <= acc_q;
+                                        out_q <= breg_q;
+                                        z_q   <= (breg_q == 4'h0);
+                                        c_q   <= 1'b0;
+                                    end
                                 end
 
                                 default: begin // PARITY / ECC nibble
@@ -560,37 +586,56 @@ module tt_um_kazan_rqpu (
 
                         // -------------------------------------------------
                         // 100: Control / flags family
+                        // mode=0: SETACC / SETSHD / CMP / CLEAR
+                        // mode=1: SETBREG / reserved / reserved / reserved
                         // -------------------------------------------------
                         CLS_CTRL: begin
-                            case (ir_func_q[1:0])
-                                2'b00: begin // SETACC immediate
-                                    checkpoint_no_write();
-                                    acc_q <= arg_b_q;
-                                    out_q <= arg_b_q;
-                                    z_q   <= (arg_b_q == 4'h0);
-                                    c_q   <= 1'b0;
-                                end
-                                2'b01: begin // SETSHD immediate
-                                    checkpoint_no_write();
-                                    shd_q <= arg_b_q;
-                                    out_q <= arg_b_q;
-                                    z_q   <= (arg_b_q == 4'h0);
-                                    c_q   <= 1'b0;
-                                end
-                                2'b10: begin // CMP => OUT={0,GT,EQ,LT}, Z=EQ, C=GT
-                                    out_q <= {1'b0, gt_cmp, eq_cmp, lt_cmp};
-                                    z_q   <= eq_cmp;
-                                    c_q   <= gt_cmp;
-                                end
-                                default: begin // CLEAR working state (not RAM)
-                                    checkpoint_no_write();
-                                    acc_q <= 4'h0;
-                                    shd_q <= 4'h0;
-                                    out_q <= 4'h0;
-                                    z_q   <= 1'b1;
-                                    c_q   <= 1'b0;
-                                end
-                            endcase
+                            if (!ir_mode_q) begin
+                                case (ir_func_q[1:0])
+                                    2'b00: begin // SETACC immediate
+                                        checkpoint_no_write();
+                                        acc_q <= arg_b_q;
+                                        out_q <= arg_b_q;
+                                        z_q   <= (arg_b_q == 4'h0);
+                                        c_q   <= 1'b0;
+                                    end
+                                    2'b01: begin // SETSHD immediate
+                                        checkpoint_no_write();
+                                        shd_q <= arg_b_q;
+                                        out_q <= arg_b_q;
+                                        z_q   <= (arg_b_q == 4'h0);
+                                        c_q   <= 1'b0;
+                                    end
+                                    2'b10: begin // CMP => OUT={0,GT,EQ,LT}, Z=EQ, C=GT
+                                        out_q <= {1'b0, gt_cmp, eq_cmp, lt_cmp};
+                                        z_q   <= eq_cmp;
+                                        c_q   <= gt_cmp;
+                                    end
+                                    default: begin // CLEAR working state (not RAM or BREG)
+                                        checkpoint_no_write();
+                                        acc_q <= 4'h0;
+                                        shd_q <= 4'h0;
+                                        out_q <= 4'h0;
+                                        z_q   <= 1'b1;
+                                        c_q   <= 1'b0;
+                                    end
+                                endcase
+                            end else begin
+                                case (ir_func_q[1:0])
+                                    2'b00: begin // SETBREG immediate
+                                        checkpoint_no_write();
+                                        breg_q <= arg_b_q;
+                                        out_q  <= arg_b_q;
+                                        z_q    <= (arg_b_q == 4'h0);
+                                        c_q    <= 1'b0;
+                                    end
+                                    default: begin // reserved NOP
+                                        out_q <= acc_q;
+                                        z_q   <= (acc_q == 4'h0);
+                                        c_q   <= c_q;
+                                    end
+                                endcase
+                            end
                         end
 
                         default: begin // reserved NOP
