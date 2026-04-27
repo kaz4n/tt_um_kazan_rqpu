@@ -103,21 +103,12 @@ async def issue(dut, cls: int, mode: int, func: int, a: int = 0, b: int = 0) -> 
     return s3
 
 
-# Helpers for RF classes
-# RFALU P1 encoding: A[3:2]=rs, A[1:0]=rt, B[3:2]=rd, B[1:0]=0
-
-def rfalu_oper(rs: int, rt: int, rd: int):
-    a = ((rs & 0x3) << 2) | (rt & 0x3)
-    b = ((rd & 0x3) << 2)
-    return a, b
-
-
 @cocotb.test()
 async def test_rqpu_with_4x4_register_file(dut):
     cocotb.start_soon(Clock(dut.clk, 10, unit="us").start())
     await reset_dut(dut)
 
-    # Basic sanity on existing immediate ALU path
+    # SETACC + immediate ALU path
     out = await issue(dut, CLS_CTRL, 0, FUNC0, 0x0, 0x6)  # SETACC 6
     assert out["data"] == 0x6 and out["z"] == 0 and out["c"] == 0, out
     out = await issue(dut, CLS_ALU, 0, FUNC0, 0x0, 0x3)   # ADD 3
@@ -135,14 +126,16 @@ async def test_rqpu_with_4x4_register_file(dut):
     assert out["data"] == 0x3 and out["z"] == 0, out
 
     # r0 + r1 -> r2
-    a, b = rfalu_oper(0, 1, 2)
+    a = ((0 & 0x3) << 2) | (1 & 0x3)
+    b = ((2 & 0x3) << 2)
     out = await issue(dut, CLS_RFALU, 0, FUNC0, a, b)     # ADD
     assert out["data"] == 0x8 and out["z"] == 0 and out["c"] == 0, out
     out = await issue(dut, CLS_RFIO, 0, FUNC1, 0x2, 0x0)  # RFREAD r2
     assert out["data"] == 0x8 and out["z"] == 0, out
 
     # r0 - r1 -> r3
-    a, b = rfalu_oper(0, 1, 3)
+    a = ((0 & 0x3) << 2) | (1 & 0x3)
+    b = ((3 & 0x3) << 2)
     out = await issue(dut, CLS_RFALU, 1, FUNC0, a, b)     # SUB
     assert out["data"] == 0x2 and out["z"] == 0 and out["c"] == 1, out
     out = await issue(dut, CLS_RFIO, 0, FUNC1, 0x3, 0x0)  # RFREAD r3
@@ -162,7 +155,8 @@ async def test_rqpu_with_4x4_register_file(dut):
     assert out["data"] == 0x3 and out["z"] == 0, out
 
     # REVERSE after RFALU write should restore r2 old value (currently 8 -> overwrite with XOR -> restore 8)
-    a, b = rfalu_oper(0, 1, 2)
+    a = ((0 & 0x3) << 2) | (1 & 0x3)
+    b = ((2 & 0x3) << 2)
     out = await issue(dut, CLS_RFALU, 0, FUNC1, a, b)     # XOR r0 ^ r1 -> r2 = 6
     assert out["data"] == 0x6 and out["z"] == 0, out
     _ = await issue(dut, CLS_REV, 0, FUNC1, 0x0, 0x0)     # REVERSE

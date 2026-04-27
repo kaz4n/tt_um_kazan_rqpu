@@ -65,9 +65,7 @@ module tt_um_kazan_rqpu (
     localparam [2:0] CLS_MEM   = 3'b010;
     localparam [2:0] CLS_REV   = 3'b011;
     localparam [2:0] CLS_CTRL  = 3'b100;
-    // 101: RFALU (2-read / 1-write register-file ALU)
     localparam [2:0] CLS_RFALU = 3'b101;
-    // 110: RFIO  (register-file utility ops)
     localparam [2:0] CLS_RFIO  = 3'b110;
     // 111 reserved as NOP
 
@@ -98,7 +96,7 @@ module tt_um_kazan_rqpu (
     reg       c_q;
 
     reg [3:0] ram_q [0:3];
-    reg [3:0] rf_q  [0:3]; // standalone 4x4 register file
+    reg [3:0] rf_q  [0:3];
 
     // Undo / checkpoint state
     reg [3:0] prev_acc_q;
@@ -287,16 +285,16 @@ module tt_um_kazan_rqpu (
         reg [3:0] tmp_data;
         reg [3:0] old_mapped;
         reg [3:0] alu_rhs;
+        reg [3:0] rf_rs_data;
+        reg [3:0] rf_rt_data;
         reg [1:0] a2;
+        reg [1:0] rs2;
+        reg [1:0] rt2;
+        reg [1:0] rd2;
         reg gt_cmp;
         reg eq_cmp;
         reg lt_cmp;
         reg no_borrow;
-        reg [1:0] rs_idx;
-        reg [1:0] rt_idx;
-        reg [1:0] rd_idx;
-        reg [3:0] rf_rs_data;
-        reg [3:0] rf_rt_data;
         if (!rst_n) begin
             phase_q <= P0_INSTR;
             ir_class_q <= 3'b000;
@@ -329,16 +327,16 @@ module tt_um_kazan_rqpu (
                 rf_q[i]  <= 4'h0;
             end
         end else if (ena) begin
-            a2      = arg_a_q[1:0];
-            rs_idx  = arg_a_q[3:2];
-            rt_idx  = arg_a_q[1:0];
-            rd_idx  = arg_b_q[3:2];
-            rf_rs_data = rf_read(rs_idx);
-            rf_rt_data = rf_read(rt_idx);
-            alu_rhs = arg_a_q[0] ? breg_q : arg_b_q;
-            gt_cmp  = (acc_q > arg_b_q);
-            eq_cmp  = (acc_q == arg_b_q);
-            lt_cmp  = (acc_q < arg_b_q);
+            a2         = arg_a_q[1:0];
+            rs2        = arg_a_q[3:2];
+            rt2        = arg_a_q[1:0];
+            rd2        = arg_b_q[3:2];
+            alu_rhs    = arg_a_q[0] ? breg_q : arg_b_q;
+            rf_rs_data = rf_read(rs2);
+            rf_rt_data = rf_read(rt2);
+            gt_cmp     = (acc_q > arg_b_q);
+            eq_cmp     = (acc_q == arg_b_q);
+            lt_cmp     = (acc_q < arg_b_q);
             case (phase_q)
                 P0_INSTR: begin
                     ir_class_q <= ui_in[7:5];
@@ -588,13 +586,13 @@ module tt_um_kazan_rqpu (
                                                 rf_q[undo_write_addr_q] <= undo_write_olddata_q;
                                             end
                                         end
-                                        acc_q <= prev_acc_q;
+                                        acc_q  <= prev_acc_q;
                                         breg_q <= prev_breg_q;
-                                        shd_q <= prev_shd_q;
-                                        out_q <= prev_out_q;
-                                        z_q   <= prev_z_q;
-                                        c_q   <= prev_c_q;
-                                        undo_valid_q <= 1'b0;
+                                        shd_q  <= prev_shd_q;
+                                        out_q  <= prev_out_q;
+                                        z_q    <= prev_z_q;
+                                        c_q    <= prev_c_q;
+                                        undo_valid_q       <= 1'b0;
                                         undo_write_valid_q <= 1'b0;
                                     end else begin
                                         out_q <= acc_q;
@@ -684,114 +682,123 @@ module tt_um_kazan_rqpu (
                         end
 
                         // -------------------------------------------------
-                        // 101: RFALU family
-                        // mode/func map matches CLS_ALU
-                        // P1 encoding: A[3:2]=rs, A[1:0]=rt, B[3:2]=rd
+                        // 101: Register-file ALU family
+                        // P1 operand encoding:
+                        //   A[3:2] = rs, A[1:0] = rt
+                        //   B[3:2] = rd, B[1:0] reserved
+                        // mode=0: ADD/XOR/AND/OR
+                        // mode=1: SUB/XNOR/NAND/NOR
                         // -------------------------------------------------
                         CLS_RFALU: begin
-                            checkpoint_rf_write(rd_idx, rf_q[rd_idx]);
+                            checkpoint_rf_write(rd2, rf_q[rd2]);
                             if (!ir_mode_q) begin
                                 case (ir_func_q[1:0])
-                                    2'b00: begin // ADD
+                                    2'b00: begin // RF ADD
                                         ext5 = {1'b0, rf_rs_data} + {1'b0, rf_rt_data};
-                                        rf_q[rd_idx] <= ext5[3:0];
-                                        out_q <= ext5[3:0];
-                                        z_q   <= (ext5[3:0] == 4'h0);
-                                        c_q   <= ext5[4];
+                                        rf_q[rd2] <= ext5[3:0];
+                                        out_q     <= ext5[3:0];
+                                        z_q       <= (ext5[3:0] == 4'h0);
+                                        c_q       <= ext5[4];
                                     end
-                                    2'b01: begin // XOR
-                                        tmp_data = rf_rs_data ^ rf_rt_data;
-                                        rf_q[rd_idx] <= tmp_data;
-                                        out_q <= tmp_data;
-                                        z_q   <= (tmp_data == 4'h0);
-                                        c_q   <= 1'b0;
+                                    2'b01: begin // RF XOR
+                                        tmp_data   = rf_rs_data ^ rf_rt_data;
+                                        rf_q[rd2] <= tmp_data;
+                                        out_q     <= tmp_data;
+                                        z_q       <= (tmp_data == 4'h0);
+                                        c_q       <= 1'b0;
                                     end
-                                    2'b10: begin // AND
-                                        tmp_data = rf_rs_data & rf_rt_data;
-                                        rf_q[rd_idx] <= tmp_data;
-                                        out_q <= tmp_data;
-                                        z_q   <= (tmp_data == 4'h0);
-                                        c_q   <= 1'b0;
+                                    2'b10: begin // RF AND
+                                        tmp_data   = rf_rs_data & rf_rt_data;
+                                        rf_q[rd2] <= tmp_data;
+                                        out_q     <= tmp_data;
+                                        z_q       <= (tmp_data == 4'h0);
+                                        c_q       <= 1'b0;
                                     end
-                                    default: begin // OR
-                                        tmp_data = rf_rs_data | rf_rt_data;
-                                        rf_q[rd_idx] <= tmp_data;
-                                        out_q <= tmp_data;
-                                        z_q   <= (tmp_data == 4'h0);
-                                        c_q   <= 1'b0;
+                                    default: begin // RF OR
+                                        tmp_data   = rf_rs_data | rf_rt_data;
+                                        rf_q[rd2] <= tmp_data;
+                                        out_q     <= tmp_data;
+                                        z_q       <= (tmp_data == 4'h0);
+                                        c_q       <= 1'b0;
                                     end
                                 endcase
                             end else begin
                                 case (ir_func_q[1:0])
-                                    2'b00: begin // SUB
-                                        tmp_data = rf_rs_data - rf_rt_data;
+                                    2'b00: begin // RF SUB
+                                        tmp_data  = rf_rs_data - rf_rt_data;
                                         no_borrow = (rf_rs_data >= rf_rt_data);
-                                        rf_q[rd_idx] <= tmp_data;
-                                        out_q <= tmp_data;
-                                        z_q   <= (tmp_data == 4'h0);
-                                        c_q   <= no_borrow;
+                                        rf_q[rd2] <= tmp_data;
+                                        out_q     <= tmp_data;
+                                        z_q       <= (tmp_data == 4'h0);
+                                        c_q       <= no_borrow;
                                     end
-                                    2'b01: begin // XNOR
-                                        tmp_data = ~(rf_rs_data ^ rf_rt_data);
-                                        rf_q[rd_idx] <= tmp_data;
-                                        out_q <= tmp_data;
-                                        z_q   <= (tmp_data == 4'h0);
-                                        c_q   <= 1'b0;
+                                    2'b01: begin // RF XNOR
+                                        tmp_data   = ~(rf_rs_data ^ rf_rt_data);
+                                        rf_q[rd2] <= tmp_data;
+                                        out_q     <= tmp_data;
+                                        z_q       <= (tmp_data == 4'h0);
+                                        c_q       <= 1'b0;
                                     end
-                                    2'b10: begin // NAND
-                                        tmp_data = ~(rf_rs_data & rf_rt_data);
-                                        rf_q[rd_idx] <= tmp_data;
-                                        out_q <= tmp_data;
-                                        z_q   <= (tmp_data == 4'h0);
-                                        c_q   <= 1'b0;
+                                    2'b10: begin // RF NAND
+                                        tmp_data   = ~(rf_rs_data & rf_rt_data);
+                                        rf_q[rd2] <= tmp_data;
+                                        out_q     <= tmp_data;
+                                        z_q       <= (tmp_data == 4'h0);
+                                        c_q       <= 1'b0;
                                     end
-                                    default: begin // NOR
-                                        tmp_data = ~(rf_rs_data | rf_rt_data);
-                                        rf_q[rd_idx] <= tmp_data;
-                                        out_q <= tmp_data;
-                                        z_q   <= (tmp_data == 4'h0);
-                                        c_q   <= 1'b0;
+                                    default: begin // RF NOR
+                                        tmp_data   = ~(rf_rs_data | rf_rt_data);
+                                        rf_q[rd2] <= tmp_data;
+                                        out_q     <= tmp_data;
+                                        z_q       <= (tmp_data == 4'h0);
+                                        c_q       <= 1'b0;
                                     end
                                 endcase
                             end
                         end
 
                         // -------------------------------------------------
-                        // 110: RFIO family
-                        // func00: RFLOADI  (rf[A[1:0]] <= B)
-                        // func01: RFREAD   (OUT <= rf[A[1:0]])
-                        // func10: RFTOACC  (ACC <= rf[A[1:0]])
-                        // func11: ACCTORF  (rf[A[1:0]] <= ACC)
+                        // 110: Register-file utility family
+                        // P1 operand encoding:
+                        //   A[1:0] = reg index
+                        //   B       = data nibble (for RFLOADI)
+                        // func=00: RFLOADI  rf[A] <= B
+                        // func=01: RFREAD   OUT   <= rf[A]
+                        // func=10: RFTOACC  ACC   <= rf[A]
+                        // func=11: ACCTORF  rf[A] <= ACC
                         // -------------------------------------------------
                         CLS_RFIO: begin
                             case (ir_func_q[1:0])
                                 2'b00: begin // RFLOADI
                                     checkpoint_rf_write(a2, rf_q[a2]);
                                     rf_q[a2] <= arg_b_q;
-                                    out_q <= arg_b_q;
-                                    z_q   <= (arg_b_q == 4'h0);
-                                    c_q   <= 1'b0;
+                                    out_q    <= arg_b_q;
+                                    z_q      <= (arg_b_q == 4'h0);
+                                    c_q      <= 1'b0;
                                 end
+
                                 2'b01: begin // RFREAD (non-mutating)
                                     tmp_data = rf_q[a2];
-                                    out_q <= tmp_data;
-                                    z_q   <= (tmp_data == 4'h0);
-                                    c_q   <= 1'b0;
+                                    out_q    <= tmp_data;
+                                    z_q      <= (tmp_data == 4'h0);
+                                    c_q      <= 1'b0;
                                 end
+
                                 2'b10: begin // RFTOACC
                                     checkpoint_no_write();
                                     tmp_data = rf_q[a2];
-                                    acc_q <= tmp_data;
-                                    out_q <= tmp_data;
-                                    z_q   <= (tmp_data == 4'h0);
-                                    c_q   <= 1'b0;
+                                    acc_q    <= tmp_data;
+                                    out_q    <= tmp_data;
+                                    z_q      <= (tmp_data == 4'h0);
+                                    c_q      <= 1'b0;
                                 end
+
                                 default: begin // ACCTORF
                                     checkpoint_rf_write(a2, rf_q[a2]);
                                     rf_q[a2] <= acc_q;
-                                    out_q <= acc_q;
-                                    z_q   <= (acc_q == 4'h0);
-                                    c_q   <= 1'b0;
+                                    out_q    <= acc_q;
+                                    z_q      <= (acc_q == 4'h0);
+                                    c_q      <= 1'b0;
                                 end
                             endcase
                         end
@@ -823,3 +830,4 @@ module tt_um_kazan_rqpu (
 endmodule
 
 `default_nettype wire
+
