@@ -91,11 +91,13 @@ async def issue(dut, cls: int, mode: int, func: int, a: int = 0, b: int = 0) -> 
 
     dut.ui_in.value = pack_instr(cls, mode, func)
     await advance_and_check(dut, P1_OPERAND)
+    await Timer(1, unit="ns")
 
     dut.ui_in.value = pack_oper(a, b)
     await advance_and_check(dut, P2_EXECUTE)
     out = await advance_and_check(dut, P3_OUTPUT)
     await advance_and_check(dut, P0_INSTR)
+    await Timer(1, unit="ns")
 
     dut.ui_in.value = 0
     return out
