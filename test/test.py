@@ -104,7 +104,7 @@ async def issue(dut, cls: int, mode: int, func: int, a: int = 0, b: int = 0) -> 
 
 
 @cocotb.test()
-async def test_rqpu_rf_extended(dut):
+async def test_rqpu(dut):
     cocotb.start_soon(Clock(dut.clk, 10, unit="us").start())
     await reset_dut(dut)
 
