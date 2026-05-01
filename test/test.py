@@ -7,18 +7,28 @@ P1_OPERAND = 0b01
 P2_EXECUTE = 0b10
 P3_OUTPUT = 0b11
 
-CLS_ALU   = 0b000
-CLS_PERM  = 0b001
-CLS_MEM   = 0b010
-CLS_REV   = 0b011
-CLS_CTRL  = 0b100
-CLS_RFALU = 0b101
-CLS_RFIO  = 0b110
+CLS_ARITH = 0b000
+CLS_LOGIC = 0b001
+CLS_SHIFT = 0b010
+CLS_CMP   = 0b011
+CLS_MEM   = 0b100
+CLS_SYS   = 0b101
+CLS_REV   = 0b110
+CLS_CTRL  = 0b111
 
-FUNC0 = 0x0
-FUNC1 = 0x1
-FUNC2 = 0x2
-FUNC3 = 0x3
+# System-register addresses used by the current broad-v2 RTL.
+SYS_ACC   = 0x0
+SYS_BREG  = 0x1
+SYS_SHD   = 0x2
+SYS_FLAGS = 0x3
+SYS_MAR   = 0x8
+SYS_MDR   = 0x9
+SYS_OUT   = 0xA
+SYS_PHS   = 0xB
+SYS_TMP0  = 0xC
+SYS_TMP1  = 0xD
+SYS_EXT0  = 0xE
+SYS_EXT1  = 0xF
 
 
 def pack_instr(cls: int, mode: int, func: int) -> int:
@@ -40,6 +50,7 @@ def decode_uo(raw: int) -> dict:
 
 
 async def edge_settle() -> None:
+    # Let HDL updates settle before sampling outputs.
     await Timer(2, unit="ns")
     await ReadOnly()
 
@@ -79,8 +90,8 @@ async def reset_dut(dut) -> None:
     state = decode_uo(int(dut.uo_out.value))
     assert state["phase"] == P0_INSTR, f"reset phase mismatch: {state}"
     assert state["data"] == 0, f"reset data mismatch: {state}"
-    assert int(dut.uio_out.value) == 0
-    assert int(dut.uio_oe.value) == 0
+    assert int(dut.uio_out.value) == 0, f"uio_out should be 0"
+    assert int(dut.uio_oe.value) == 0, f"uio_oe should be 0"
 
     dut.ena.value = 1
     await Timer(1, unit="ns")
@@ -98,114 +109,132 @@ async def issue(dut, cls: int, mode: int, func: int, a: int = 0, b: int = 0) -> 
     s2 = await advance_and_check(dut, P2_EXECUTE)
     dut._log.info(f"P2 ui_in={int(dut.ui_in.value):08b} uo_out={s2['raw']:08b}")
 
-    out = await advance_and_check(dut, P3_OUTPUT)
-    dut._log.info(f"P3 ui_in={int(dut.ui_in.value):08b} uo_out={out['raw']:08b}")
+    s3 = await advance_and_check(dut, P3_OUTPUT)
+    dut._log.info(f"P3 ui_in={int(dut.ui_in.value):08b} uo_out={s3['raw']:08b}")
 
     s0 = await advance_and_check(dut, P0_INSTR)
     dut._log.info(f"P0 ui_in={int(dut.ui_in.value):08b} uo_out={s0['raw']:08b}")
 
     await Timer(1, unit="ns")
     dut.ui_in.value = 0
-    return out
-
-
-async def rf_loadi(dut, idx: int, value: int) -> dict:
-    return await issue(dut, CLS_RFIO, 0, FUNC0, idx & 0x3, value & 0xF)
-
-
-async def rf_read(dut, idx: int) -> dict:
-    return await issue(dut, CLS_RFIO, 0, FUNC1, idx & 0x3, 0)
-
-
-async def rf_to_acc(dut, idx: int) -> dict:
-    return await issue(dut, CLS_RFIO, 0, FUNC2, idx & 0x3, 0)
-
-
-async def acc_to_rf(dut, idx: int) -> dict:
-    return await issue(dut, CLS_RFIO, 0, FUNC3, idx & 0x3, 0)
-
-
-async def rf_alu(dut, mode: int, func: int, rs: int, rt: int, rd: int) -> dict:
-    a = ((rs & 0x3) << 2) | (rt & 0x3)
-    b = ((rd & 0x3) << 2)
-    return await issue(dut, CLS_RFALU, mode, func, a, b)
+    return s3
 
 
 @cocotb.test()
-async def test_rqpu(dut):
+async def test_rqpu_broad_v2(dut):
     cocotb.start_soon(Clock(dut.clk, 10, unit="us").start())
     await reset_dut(dut)
 
-    # Core working regs according to current RTL:
-    # CTRL func0=SETACC, func1=SETSHD, func2=SETBREG, func3=CMP
-    out = await issue(dut, CLS_CTRL, 0, FUNC0, 0x0, 0x6)  # ACC=6
-    assert out["data"] == 0x6 and out["z"] == 0, out
+    # ------------------------------------------------------------------
+    # Direct control/setup path
+    # ------------------------------------------------------------------
+    out = await issue(dut, CLS_CTRL, 0, 0xA, 0x0, 0x6)  # ACC <= 6
+    assert out["data"] == 0x6 and out["z"] == 0 and out["c"] == 0, out
 
-    out = await issue(dut, CLS_CTRL, 0, FUNC1, 0x0, 0x9)  # SHD=9
-    assert out["data"] == 0x9 and out["z"] == 0, out
-
-    out = await issue(dut, CLS_CTRL, 0, FUNC2, 0x0, 0xA)  # BREG=A
-    assert out["data"] == 0xA and out["z"] == 0, out
-
-    # Standalone register file: write r1=5 and r2=3
-    out = await rf_loadi(dut, 1, 0x5)
-    assert out["data"] == 0x5 and out["z"] == 0, out
-
-    out = await rf_loadi(dut, 2, 0x3)
+    out = await issue(dut, CLS_CTRL, 0, 0x4, 0x0, 0x3)  # BREG <= 3
     assert out["data"] == 0x3 and out["z"] == 0, out
 
-    # Read back r1 and r2 explicitly so failures localize before RFALU.
-    out = await rf_read(dut, 1)
-    assert out["data"] == 0x5 and out["z"] == 0, f"RFREAD r1 failed: {out}"
-
-    out = await rf_read(dut, 2)
-    assert out["data"] == 0x3 and out["z"] == 0, f"RFREAD r2 failed: {out}"
-
-    # r3 = r1 + r2 = 8
-    out = await rf_alu(dut, 0, FUNC0, 1, 2, 3)
-    assert out["data"] == 0x8 and out["z"] == 0 and out["c"] == 0, (
-        "RFALU ADD mismatch; if this returns the previous output instead of 8, "
-        "the RTL being compiled likely does not include the RFALU implementation. "
-        f"Observed: {out}"
-    )
-
-    out = await rf_read(dut, 3)
-    assert out["data"] == 0x8 and out["z"] == 0, f"RFREAD r3 failed: {out}"
-
-    # r0 = XNOR(r1, r2) = ~(5 ^ 3) = 9
-    out = await rf_alu(dut, 1, FUNC1, 1, 2, 0)
+    out = await issue(dut, CLS_CTRL, 0, 0x5, 0x0, 0x9)  # SHD <= 9
     assert out["data"] == 0x9 and out["z"] == 0, out
 
-    # move r0 -> ACC and verify round-trip
-    out = await rf_to_acc(dut, 0)
-    assert out["data"] == 0x9 and out["z"] == 0, out
+    # ------------------------------------------------------------------
+    # Arithmetic family: immediate source and system-register source
+    # mode=0 => immediate B, mode=1 => sys_read(A)
+    # ------------------------------------------------------------------
+    out = await issue(dut, CLS_ARITH, 0, 0x0, 0x0, 0x3)  # ADD imm 3 => 6+3=9
+    assert out["data"] == 0x9 and out["z"] == 0 and out["c"] == 0, out
 
-    # ECC / parity nibble from ACC should be non-zero for 9 under current code
-    out = await issue(dut, CLS_REV, 0, FUNC3, 0x0, 0x0)
-    assert out["data"] != 0x0, out
+    out = await issue(dut, CLS_ARITH, 1, 0x2, SYS_BREG, 0x0)  # SUB BREG(3) => 9-3=6
+    assert out["data"] == 0x6 and out["z"] == 0 and out["c"] == 1, out
 
-    # Compare low 3 bits: ACC=9 => 001 vs imm=1 => EQ
-    out = await issue(dut, CLS_CTRL, 1, FUNC3, 0x0, 0x1)
+    # ------------------------------------------------------------------
+    # Logic family
+    # ------------------------------------------------------------------
+    out = await issue(dut, CLS_LOGIC, 0, 0x6, 0x0, 0x3)  # XNOR imm 3 => ~(6^3)=A
+    assert out["data"] == 0xA and out["z"] == 0 and out["c"] == 0, out
+
+    # ------------------------------------------------------------------
+    # Shift / permute family
+    # ------------------------------------------------------------------
+    out = await issue(dut, CLS_CTRL, 0, 0xA, 0x0, 0x9)  # ACC <= 9
+    assert out["data"] == 0x9, out
+
+    out = await issue(dut, CLS_SHIFT, 0, 0x0, 0x0, 0x0)  # SHL: 9 -> 2, carrylike=1
+    assert out["data"] == 0x2 and out["c"] == 1, out
+
+    out = await issue(dut, CLS_SHIFT, 0, 0x5, 0x0, 0x0)  # BITREV: 2 -> 4
+    assert out["data"] == 0x4 and out["z"] == 0, out
+
+    # ------------------------------------------------------------------
+    # Compare family
+    # ------------------------------------------------------------------
+    out = await issue(dut, CLS_CTRL, 0, 0xA, 0x0, 0x5)  # ACC <= 5
+    assert out["data"] == 0x5, out
+
+    out = await issue(dut, CLS_CMP, 0, 0x0, 0x0, 0x5)  # CMP imm 5 => {0,0,1,0}=2
     assert out["data"] == 0x2 and out["z"] == 1 and out["c"] == 0, out
 
-    # Gray encode/decode round trip for ACC
-    out = await issue(dut, CLS_PERM, 1, FUNC2, 0x0, 0x0)
-    gray = out["data"]
-    out = await issue(dut, CLS_PERM, 1, FUNC3, 0x0, 0x0)
-    assert out["data"] == 0x9, (gray, out)
+    # ------------------------------------------------------------------
+    # Memory family: RAM read/write/loadacc
+    # ------------------------------------------------------------------
+    out = await issue(dut, CLS_MEM, 0, 0x1, 0x2, 0xC)  # RAM[2] <= C
+    assert out["data"] == 0xC and out["z"] == 0, out
 
-    # RAM write then reverse restore
-    out = await issue(dut, CLS_MEM, 0, FUNC1, 0x2, 0xC)
-    assert out["data"] == 0xC, out
-    out = await issue(dut, CLS_MEM, 0, FUNC1, 0x2, 0xA)
+    out = await issue(dut, CLS_MEM, 0, 0x0, 0x2, 0x0)  # READ RAM[2]
+    assert out["data"] == 0xC and out["z"] == 0, out
+
+    out = await issue(dut, CLS_MEM, 0, 0x2, 0x2, 0x0)  # LOADACC RAM[2]
+    assert out["data"] == 0xC and out["z"] == 0, out
+
+    # ------------------------------------------------------------------
+    # SYS family + MEM system-space access
+    # ------------------------------------------------------------------
+    out = await issue(dut, CLS_SYS, 0, 0x3, SYS_TMP0, 0x7)  # LOADIMM TMP0 <= 7
+    assert out["data"] == 0x7 and out["z"] == 0, out
+
+    out = await issue(dut, CLS_SYS, 0, 0x0, SYS_TMP0, SYS_TMP1)  # MOV TMP1 <= TMP0
+    assert out["data"] == 0x7 and out["z"] == 0, out
+
+    out = await issue(dut, CLS_MEM, 1, 0x0, SYS_TMP1, 0x0)  # READ system TMP1
+    assert out["data"] == 0x7 and out["z"] == 0, out
+
+    # ------------------------------------------------------------------
+    # REV family: ACC <-> BREG and REVERSE
+    # ------------------------------------------------------------------
+    out = await issue(dut, CLS_CTRL, 0, 0xA, 0x0, 0x4)  # ACC <= 4
+    assert out["data"] == 0x4, out
+
+    out = await issue(dut, CLS_CTRL, 0, 0x4, 0x0, 0xA)  # BREG <= A
     assert out["data"] == 0xA, out
-    _ = await issue(dut, CLS_REV, 0, FUNC1, 0x0, 0x0)
-    out = await issue(dut, CLS_MEM, 0, FUNC0, 0x2, 0x0)
-    assert out["data"] == 0xC, out
 
-    # RF write then reverse restore
-    out = await rf_loadi(dut, 1, 0xE)
-    assert out["data"] == 0xE, out
-    _ = await issue(dut, CLS_REV, 0, FUNC1, 0x0, 0x0)
-    out = await rf_read(dut, 1)
+    out = await issue(dut, CLS_REV, 0, 0x3, 0x0, 0x0)  # ACC <-> BREG
+    assert out["data"] == 0xA and out["z"] == 0, out
+
+    out = await issue(dut, CLS_MEM, 1, 0x0, SYS_ACC, 0x0)  # READ ACC => A
+    assert out["data"] == 0xA, out
+
+    _ = await issue(dut, CLS_REV, 0, 0x1, 0x0, 0x0)  # REVERSE
+    out = await issue(dut, CLS_MEM, 1, 0x0, SYS_ACC, 0x0)  # READ ACC => 4
+    assert out["data"] == 0x4, out
+
+    # ------------------------------------------------------------------
+    # SHIFT default path = parity nibble output from ACC
+    # Set ACC to 5 => parity bit 0 (two ones)
+    # ------------------------------------------------------------------
+    out = await issue(dut, CLS_CTRL, 0, 0xA, 0x0, 0x5)
     assert out["data"] == 0x5, out
+    out = await issue(dut, CLS_SHIFT, 0, 0x7, 0x0, 0x0)  # default/PARITY
+    assert out["data"] == 0x0 and out["z"] == 1, out
+
+    # ------------------------------------------------------------------
+    # Tracked RAM write undo via REVERSE
+    # ------------------------------------------------------------------
+    out = await issue(dut, CLS_MEM, 0, 0x1, 0x1, 0xA)  # RAM[1] <= A
+    assert out["data"] == 0xA, out
+
+    out = await issue(dut, CLS_MEM, 0, 0x1, 0x1, 0x3)  # RAM[1] <= 3
+    assert out["data"] == 0x3, out
+
+    _ = await issue(dut, CLS_REV, 0, 0x1, 0x0, 0x0)    # REVERSE last write
+    out = await issue(dut, CLS_MEM, 0, 0x0, 0x1, 0x0)  # READ RAM[1] => A restored
+    assert out["data"] == 0xA, out
