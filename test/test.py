@@ -90,17 +90,45 @@ async def issue(dut, cls: int, mode: int, func: int, a: int = 0, b: int = 0) -> 
     await sync_p0_writable(dut)
 
     dut.ui_in.value = pack_instr(cls, mode, func)
-    await advance_and_check(dut, P1_OPERAND)
-    await Timer(1, unit="ns")
+    s1 = await advance_and_check(dut, P1_OPERAND)
+    dut._log.info(f"P1 ui_in={int(dut.ui_in.value):08b} uo_out={s1['raw']:08b}")
 
+    await Timer(1, unit="ns")
     dut.ui_in.value = pack_oper(a, b)
-    await advance_and_check(dut, P2_EXECUTE)
-    out = await advance_and_check(dut, P3_OUTPUT)
-    await advance_and_check(dut, P0_INSTR)
-    await Timer(1, unit="ns")
+    s2 = await advance_and_check(dut, P2_EXECUTE)
+    dut._log.info(f"P2 ui_in={int(dut.ui_in.value):08b} uo_out={s2['raw']:08b}")
 
+    out = await advance_and_check(dut, P3_OUTPUT)
+    dut._log.info(f"P3 ui_in={int(dut.ui_in.value):08b} uo_out={out['raw']:08b}")
+
+    s0 = await advance_and_check(dut, P0_INSTR)
+    dut._log.info(f"P0 ui_in={int(dut.ui_in.value):08b} uo_out={s0['raw']:08b}")
+
+    await Timer(1, unit="ns")
     dut.ui_in.value = 0
     return out
+
+
+async def rf_loadi(dut, idx: int, value: int) -> dict:
+    return await issue(dut, CLS_RFIO, 0, FUNC0, idx & 0x3, value & 0xF)
+
+
+async def rf_read(dut, idx: int) -> dict:
+    return await issue(dut, CLS_RFIO, 0, FUNC1, idx & 0x3, 0)
+
+
+async def rf_to_acc(dut, idx: int) -> dict:
+    return await issue(dut, CLS_RFIO, 0, FUNC2, idx & 0x3, 0)
+
+
+async def acc_to_rf(dut, idx: int) -> dict:
+    return await issue(dut, CLS_RFIO, 0, FUNC3, idx & 0x3, 0)
+
+
+async def rf_alu(dut, mode: int, func: int, rs: int, rt: int, rd: int) -> dict:
+    a = ((rs & 0x3) << 2) | (rt & 0x3)
+    b = ((rd & 0x3) << 2)
+    return await issue(dut, CLS_RFALU, mode, func, a, b)
 
 
 @cocotb.test()
@@ -108,62 +136,76 @@ async def test_rqpu(dut):
     cocotb.start_soon(Clock(dut.clk, 10, unit="us").start())
     await reset_dut(dut)
 
-    # Set core working regs
+    # Core working regs according to current RTL:
+    # CTRL func0=SETACC, func1=SETSHD, func2=SETBREG, func3=CMP
     out = await issue(dut, CLS_CTRL, 0, FUNC0, 0x0, 0x6)  # ACC=6
-    assert out["data"] == 0x6 and out["z"] == 0
-    out = await issue(dut, CLS_CTRL, 0, FUNC1, 0x0, 0x9)  # SHD=9
-    assert out["data"] == 0x9 and out["z"] == 0
-    out = await issue(dut, CLS_CTRL, 0, FUNC2, 0x0, 0xA)  # BREG=A
-    assert out["data"] == 0xA and out["z"] == 0
+    assert out["data"] == 0x6 and out["z"] == 0, out
 
-    # Register file loads
-    out = await issue(dut, CLS_RFIO, 0, FUNC0, 0x1, 0x5)  # r1=5
-    assert out["data"] == 0x5 and out["z"] == 0
-    out = await issue(dut, CLS_RFIO, 0, FUNC0, 0x2, 0x3)  # r2=3
-    assert out["data"] == 0x3 and out["z"] == 0
+    out = await issue(dut, CLS_CTRL, 0, FUNC1, 0x0, 0x9)  # SHD=9
+    assert out["data"] == 0x9 and out["z"] == 0, out
+
+    out = await issue(dut, CLS_CTRL, 0, FUNC2, 0x0, 0xA)  # BREG=A
+    assert out["data"] == 0xA and out["z"] == 0, out
+
+    # Standalone register file: write r1=5 and r2=3
+    out = await rf_loadi(dut, 1, 0x5)
+    assert out["data"] == 0x5 and out["z"] == 0, out
+
+    out = await rf_loadi(dut, 2, 0x3)
+    assert out["data"] == 0x3 and out["z"] == 0, out
+
+    # Read back r1 and r2 explicitly so failures localize before RFALU.
+    out = await rf_read(dut, 1)
+    assert out["data"] == 0x5 and out["z"] == 0, f"RFREAD r1 failed: {out}"
+
+    out = await rf_read(dut, 2)
+    assert out["data"] == 0x3 and out["z"] == 0, f"RFREAD r2 failed: {out}"
 
     # r3 = r1 + r2 = 8
-    out = await issue(dut, CLS_RFALU, 0, FUNC0, 0b0110, 0b1100)  # rs=1 rt=2 rd=3
-    assert out["data"] == 0x8 and out["z"] == 0 and out["c"] == 0, out
+    out = await rf_alu(dut, 0, FUNC0, 1, 2, 3)
+    assert out["data"] == 0x8 and out["z"] == 0 and out["c"] == 0, (
+        "RFALU ADD mismatch; if this returns the previous output instead of 8, "
+        "the RTL being compiled likely does not include the RFALU implementation. "
+        f"Observed: {out}"
+    )
 
-    # read r3
-    out = await issue(dut, CLS_RFIO, 0, FUNC1, 0x3, 0x0)
-    assert out["data"] == 0x8 and out["z"] == 0, out
+    out = await rf_read(dut, 3)
+    assert out["data"] == 0x8 and out["z"] == 0, f"RFREAD r3 failed: {out}"
 
-    # r0 = r1 XNOR r2 = ~(5^3)=9
-    out = await issue(dut, CLS_RFALU, 1, FUNC1, 0b0110, 0b0000)
+    # r0 = XNOR(r1, r2) = ~(5 ^ 3) = 9
+    out = await rf_alu(dut, 1, FUNC1, 1, 2, 0)
     assert out["data"] == 0x9 and out["z"] == 0, out
 
-    # transfer r0 to ACC
-    out = await issue(dut, CLS_RFIO, 0, FUNC2, 0x0, 0x0)
+    # move r0 -> ACC and verify round-trip
+    out = await rf_to_acc(dut, 0)
     assert out["data"] == 0x9 and out["z"] == 0, out
 
-    # parity/ecc from ACC=9
+    # ECC / parity nibble from ACC should be non-zero for 9 under current code
     out = await issue(dut, CLS_REV, 0, FUNC3, 0x0, 0x0)
     assert out["data"] != 0x0, out
 
-    # compare low 3 bits: ACC(1) vs imm(1) => EQ
+    # Compare low 3 bits: ACC=9 => 001 vs imm=1 => EQ
     out = await issue(dut, CLS_CTRL, 1, FUNC3, 0x0, 0x1)
-    assert out["data"] in (0x2, 0x6) or out["z"] == 1, out
+    assert out["data"] == 0x2 and out["z"] == 1 and out["c"] == 0, out
 
-    # gray encode and decode round trip for ACC
-    out = await issue(dut, CLS_PERM, 1, FUNC2, 0x0, 0x0)  # grayenc
+    # Gray encode/decode round trip for ACC
+    out = await issue(dut, CLS_PERM, 1, FUNC2, 0x0, 0x0)
     gray = out["data"]
-    out = await issue(dut, CLS_PERM, 1, FUNC3, 0x0, 0x0)  # graydec back
+    out = await issue(dut, CLS_PERM, 1, FUNC3, 0x0, 0x0)
     assert out["data"] == 0x9, (gray, out)
 
     # RAM write then reverse restore
     out = await issue(dut, CLS_MEM, 0, FUNC1, 0x2, 0xC)
-    assert out["data"] == 0xC
+    assert out["data"] == 0xC, out
     out = await issue(dut, CLS_MEM, 0, FUNC1, 0x2, 0xA)
-    assert out["data"] == 0xA
+    assert out["data"] == 0xA, out
     _ = await issue(dut, CLS_REV, 0, FUNC1, 0x0, 0x0)
     out = await issue(dut, CLS_MEM, 0, FUNC0, 0x2, 0x0)
     assert out["data"] == 0xC, out
 
     # RF write then reverse restore
-    out = await issue(dut, CLS_RFIO, 0, FUNC0, 0x1, 0xE)
-    assert out["data"] == 0xE
+    out = await rf_loadi(dut, 1, 0xE)
+    assert out["data"] == 0xE, out
     _ = await issue(dut, CLS_REV, 0, FUNC1, 0x0, 0x0)
-    out = await issue(dut, CLS_RFIO, 0, FUNC1, 0x1, 0x0)
+    out = await rf_read(dut, 1)
     assert out["data"] == 0x5, out
