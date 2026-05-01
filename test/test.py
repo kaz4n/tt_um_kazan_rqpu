@@ -17,19 +17,23 @@ CLS_REV   = 0b101
 CLS_RFALU = 0b110
 CLS_RFIO  = 0b111
 
-# Broad-v2 system addresses
+# Broad-v2 system addresses (must match Verilog)
 SYS_ACC   = 0x0
 SYS_BREG  = 0x1
 SYS_SHD   = 0x2
 SYS_FLAGS = 0x3
-SYS_MAR   = 0x8
-SYS_MDR   = 0x9
-SYS_OUT   = 0xA
-SYS_PHS   = 0xB
-SYS_TMP0  = 0xC
-SYS_TMP1  = 0xD
-SYS_EXT0  = 0xE
-SYS_EXT1  = 0xF
+SYS_MAR   = 0x4
+SYS_MDR   = 0x5
+SYS_OUT   = 0x6
+SYS_PHS   = 0x7
+SYS_TMP0  = 0x8
+SYS_TMP1  = 0x9
+SYS_EXT0  = 0xA
+SYS_EXT1  = 0xB
+SYS_RF0   = 0xC
+SYS_RF1   = 0xD
+SYS_RF2   = 0xE
+SYS_RF3   = 0xF
 
 
 def pack_instr(cls: int, mode: int, func: int) -> int:
