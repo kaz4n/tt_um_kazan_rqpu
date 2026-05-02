@@ -29,6 +29,56 @@ The core includes:
 
 The reversible behavior uses compact checkpoint metadata so `REVERSE` performs a single-step undo of recent architectural changes.
 
+
+The easiest way to understand the machine is to look at one host-issued operation.
+
+### Example: load `ACC = 6`, then add `3`
+
+#### Step 1 — write `6` into `ACC`
+
+Issue a `CLS_SYS` / `LOADIMM` operation with:
+
+- class = `CLS_SYS`
+- mode = `0`
+- func = `0x0`
+- `A = SYS_ACC`
+- `B = 0x6`
+
+After `P3_OUTPUT`, `out_q = 6`, `ACC = 6`, and `Z = 0`.
+
+#### Step 2 — add immediate `3`
+
+Issue a `CLS_ALU` / `ADD` with:
+
+- class = `CLS_ALU`
+- mode = `0`
+- func = `0x0`
+- `A = 0x0` (unused in immediate mode)
+- `B = 0x3`
+
+After `P3_OUTPUT`, the core presents:
+
+- `out_q = 9`
+- `ACC = 9`
+- `Z = 0`
+- `C = 0`
+
+### Example: reversible-style undo
+
+If you:
+
+1. load `ACC = 4`
+2. load `BREG = A`
+3. execute `CLS_REV` `ACC <-> BREG`
+
+then `ACC` becomes `A` and `BREG` becomes `4`, and the operation snapshots the old state first.
+
+If you then issue `CLS_REV` `REVERSE`, the machine swaps current and previous snapshots, restoring `ACC = 4`.
+
+That is exactly the behavior the supplied testbench checks.
+
+---
+
 ## How to test
 
 The public bus contract is:
