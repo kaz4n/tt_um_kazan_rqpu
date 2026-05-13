@@ -42,6 +42,409 @@ The GitHub action will automatically build the ASIC files using [LibreLane](http
   - Bluesky [@tinytapeout.com](https://bsky.app/profile/tinytapeout.com)
 
 
+
+
+
+
+
+
+
+
+# tt_um_kazan_rqpu
+
+> A 4-bit host-driven execution core with reversible-inspired state undo, built for [Tiny Tapeout](https://tinytapeout.com) on the SKY130A PDK.
+
+---
+
+## Quick Summary
+
+<!-- PICTURE SUGGESTION: A clean block diagram here showing the 4-phase cycle as a loop:
+     P0 (Instruction) → P1 (Operand) → P2 (Execute) → P3 (Output) → back to P0.
+     Annotate each phase with what goes on ui_in and what comes out uo_out. -->
+
+This is **not** a classical CPU. It has no program counter and fetches no instructions on its own. Instead, an external host (microcontroller, FPGA, RP2040 on a TT board) drives it one operation at a time over a strict 4-phase protocol:
+
+| Phase | Host does | Core does |
+|---|---|---|
+| `00` | Drive instruction byte on `ui_in` | Latches `class`, `mode`, `func` |
+| `01` | Drive operand byte on `ui_in` | Latches `A`, `B` |
+| `10` | Hold | Executes and commits state |
+| `11` | Sample `uo_out` | Result and flags are valid |
+
+**8 instruction classes** cover arithmetic, bit permutations, comparisons, memory, register-file ops, and — the standout feature — a full **save/reverse snapshot mechanism** inspired by reversible computing.
+
+<!-- PICTURE SUGGESTION: A pin diagram showing ui_in[7:0] split into its phase-00 fields
+     (class[2:0] | mode | func[3:0]) and phase-01 fields (A[3:0] | B[3:0]),
+     alongside uo_out[7:0] split into (phase[1:0] | data[3:0] | Z | C). -->
+
+**Output encoding:**
+```
+uo_out[7:6] = current phase
+uo_out[5:2] = result nibble
+uo_out[1]   = Z flag
+uo_out[0]   = C flag
+```
+
+### Key design tradeoffs
+
+- **Host-sequenced, not self-fetching** — gives maximum flexibility to the controller at the cost of requiring external sequencing logic.
+- **4-bit datapath** — fits comfortably in a 1×2 Tiny Tapeout tile; not suitable for general-purpose computation.
+- **Reversible-inspired, not strictly reversible** — the save/reverse snapshot is a pragmatic full-state undo, not a gate-level Toffoli/Fredkin implementation. Irreversible ops like ADD and SHL coexist with the undo mechanism.
+- **No external hardware needed** — `uio` pins are unused; you only need `ui_in`, `uo_out`, `clk`, and `rst_n`.
+
+### Instruction classes at a glance
+
+| Class | What it does |
+|---|---|
+| `CLS_ALU` | ADD, SUB, AND, OR, XOR, NOT, INC, DEC, … |
+| `CLS_PERM` | ROL, ROR, SHL, SHR, BITREV, GRAYENC, GRAYDEC, ECC |
+| `CLS_CMP` | Compare, MIN, MAX, POPCOUNT, ZERO? |
+| `CLS_MEM` | Read/write 4-word RAM or 16-entry system-register space |
+| `CLS_SYS` | Load immediate, MOV, SWAP, CLEAR on any system register |
+| `CLS_REV` | **SAVE** (snapshot), **REVERSE** (undo), register swaps, parity |
+| `CLS_RFALU` | Arithmetic and logic on the 4-entry register file |
+| `CLS_RFIO` | Load, move, swap, transfer between RF and ACC/BREG |
+
+### Quick start (host pseudocode)
+
+```python
+# 1. Reset the core
+# 2. Wait for phase 00 on uo_out[7:6]
+# 3. Drive instruction byte on ui_in, clock once
+# 4. Drive operand byte on ui_in, clock once
+# 5. Clock once (execute)
+# 6. Sample uo_out while phase == 11, clock once
+# 7. Back to phase 00 — repeat
+```
+
+For more detail, see [ARCHITECTURE.md](ARCHITECTURE.md).
+
+---
+
+---
+
+# ARCHITECTURE.md (Detailed Reference)
+
+## 1. Tiny Tapeout interface
+
+```verilog
+module tt_um_kazan_rqpu (
+    input  wire [7:0] ui_in,   // instruction byte / operand byte (phase-dependent)
+    output wire [7:0] uo_out,  // phase + result nibble + Z + C
+    input  wire [7:0] uio_in,  // unused
+    output wire [7:0] uio_out, // always 0
+    output wire [7:0] uio_oe,  // always 0 (all bidir pins stay inputs)
+    input  wire       ena,
+    input  wire       clk,
+    input  wire       rst_n    // active-low reset
+);
+```
+
+The bidirectional bank is fully unused. No PMOD required.
+
+---
+
+## 2. Four-phase protocol in detail
+
+<!-- PICTURE SUGGESTION: A waveform diagram (like a timing diagram) showing clk,
+     rst_n, ui_in, and uo_out[7:6] (phase) across 5 clock cycles for one instruction.
+     Mark each clock edge with its phase label. -->
+
+One instruction always takes exactly four clock edges:
+
+```
+Clock:   ___↑___↑___↑___↑___
+Phase:    00  01  10  11  (→ back to 00)
+ui_in:   [INSTR][OPER][hold][hold]
+uo_out:  [...  ][... ][... ][RESULT]
+```
+
+The host must:
+1. Present the instruction byte **before** the rising edge that samples P0.
+2. Present the operand byte **before** the rising edge that samples P1.
+3. Sample the result **after** the rising edge of P3 (phase `11` on `uo_out[7:6]`).
+
+`ena = 0` freezes the phase counter; the core holds all state.
+
+---
+
+## 3. Instruction encoding
+
+### Phase 00 — instruction byte
+
+```
+ui_in[7:5] = class  (3 bits, selects one of 8 operation families)
+ui_in[4]   = mode   (meaning depends on class)
+ui_in[3:0] = func   (selects specific operation within the class)
+```
+
+### Phase 01 — operand byte
+
+```
+ui_in[7:4] = A  (source address / register index / upper nibble)
+ui_in[3:0] = B  (immediate value / lower nibble / destination)
+```
+
+---
+
+## 4. Architectural state
+
+The core holds:
+
+**Working registers (4-bit each):** `ACC`, `BREG`, `SHD`, `MAR`, `MDR`, `OUT`, `TMP0`, `TMP1`, `EXT0`, `EXT1`
+
+**Status flags:** `Z` (zero), `C` (carry / no-borrow / GT), `N` (negative — internal only, not exported on pins)
+
+**Small memories:**
+- `RAM[0:3]` — 4 × 4-bit general scratchpad
+- `RF[0:3]` — 4 × 4-bit register file
+
+**Snapshot state:** A full mirror of every register above (`prev_*`) plus `undo_valid`. Used by `CLS_REV`.
+
+---
+
+## 5. System-register address space
+
+`CLS_MEM` (mode=1) and `CLS_SYS` access a 16-entry mapped space:
+
+| Addr | Name | Contents |
+|---:|---|---|
+| `0x0` | `SYS_ACC` | Accumulator |
+| `0x1` | `SYS_BREG` | B register |
+| `0x2` | `SYS_SHD` | Shadow register |
+| `0x3` | `SYS_FLAGS` | `{undo_valid, N, C, Z}` |
+| `0x4` | `SYS_MAR` | Memory address register |
+| `0x5` | `SYS_MDR` | Memory data register |
+| `0x6` | `SYS_OUT` | Output/result register |
+| `0x7` | `SYS_PHS` | `{phase[1:0], busy, valid}` (read-only) |
+| `0x8–0xB` | `TMP0/1`, `EXT0/1` | Scratch registers |
+| `0xC–0xF` | `RF0–RF3` | Register file mirrors |
+
+Writing `SYS_FLAGS` updates only `N`, `C`, `Z` — it cannot directly set `undo_valid`.
+
+---
+
+## 6. Instruction classes — operation reference
+
+### CLS_ALU `000` — Accumulator arithmetic and logic
+
+`mode=0`: `rhs = B` (immediate)  
+`mode=1`: `rhs = sys[A]`
+
+| func | Op | Effect |
+|---:|---|---|
+| `0x0` | ADD | `ACC = ACC + rhs`, updates Z/N/C |
+| `0x1` | ADC | `ACC = ACC + rhs + C` |
+| `0x2` | SUB | `ACC = ACC - rhs`, C = no-borrow |
+| `0x3` | SBC | `ACC = ACC - rhs - ~C` |
+| `0x4` | AND | `ACC = ACC & rhs` |
+| `0x5` | OR | `ACC = ACC \| rhs` |
+| `0x6` | XOR | `ACC = ACC ^ rhs` |
+| `0x7` | XNOR | `ACC = ~(ACC ^ rhs)` |
+| `0x8` | NAND | `ACC = ~(ACC & rhs)` |
+| `0x9` | NOR | `ACC = ~(ACC \| rhs)` |
+| `0xA` | NOT | `ACC = ~ACC` |
+| `0xB` | BIC | `ACC = ACC & ~rhs` |
+| `0xC` | PASS | `ACC = rhs` |
+| `0xD` | INC | `ACC = ACC + 1` |
+| `0xE` | DEC | `ACC = ACC - 1` |
+
+Every `CLS_ALU` op snapshots state first.
+
+---
+
+### CLS_PERM `001` — Shift, rotate, permute, Gray, ECC
+
+`mode=0`: source = `ACC`  
+`mode=1`: source = `sys[A]`
+
+Result is written back to `ACC` and `out_q`.
+
+| func | Op | Notes |
+|---:|---|---|
+| `0x0` | ROL | rotate left |
+| `0x1` | ROR | rotate right |
+| `0x2` | SHL | shift left, C = evicted bit |
+| `0x3` | SHR | shift right |
+| `0x4` | SWAP2 | swap upper and lower 2-bit halves |
+| `0x5` | BITREV | reverse bit order |
+| `0x6` | GRAYENC | binary → Gray |
+| `0x7` | GRAYDEC | Gray → binary |
+| `0x8` | ASR | arithmetic shift right |
+| `0x9` | ECC | compact Hamming-style parity nibble, written to ACC |
+
+ROL/ROR/SWAP2/BITREV/GRAYENC/GRAYDEC are all bijective (reversible). SHL/SHR/ASR are not.
+
+---
+
+### CLS_CMP `010` — Compare and reduction
+
+`mode=0`: compare full 4-bit `ACC` against immediate `B`  
+`mode=1`: compare lower 3 bits of `ACC` against lower 3 bits of `sys[A]` (3-bit comparator mode)
+
+Does **not** overwrite `ACC`.
+
+| func | Op | Output |
+|---:|---|---|
+| `0x0` | CMP | `{0, GT, EQ, LT}` |
+| `0x1` | EQ | `0001` if equal |
+| `0x2` | GT | `0001` if greater |
+| `0x3` | LT | `0001` if less |
+| `0x4` | MIN | minimum of the two operands |
+| `0x5` | MAX | maximum of the two operands |
+| `0x6` | POPCOUNT | count of set bits in `ACC` |
+| `0x7` | ZERO? | `0001` if `ACC == 0` |
+
+---
+
+### CLS_MEM `011` — Memory and system-space access
+
+`mode=0`: target is `RAM[A[1:0]]`  
+`mode=1`: target is `sys[A]`
+
+| func | Op | Effect |
+|---:|---|---|
+| `0x0` | READ | `MDR = mem[A]`, result to `out_q` |
+| `0x1` | WRITE | `mem[A] = B` |
+| `0x2` | LOADACC | `ACC = MDR = mem[A]` |
+| `0x3` | SWAPACC | `ACC ↔ mem[A]` |
+
+---
+
+### CLS_SYS `100` — System register operations
+
+Only `func[1:0]` is decoded — function codes `0x0`, `0x4`, `0x8`, `0xC` all behave identically as `LOADIMM`, and similarly for the others.
+
+| `func[1:0]` | Op | Effect |
+|---:|---|---|
+| `00` | LOADIMM | `sys[A] = B` |
+| `01` | MOV | `sys[A] = sys[B]` |
+| `10` | SWAP | `sys[A] ↔ sys[B]` |
+| `11` | CLEAR | `sys[A] = 0` |
+
+This is the primary way to initialize `ACC`, `BREG`, temp registers, and so on.
+
+---
+
+### CLS_REV `101` — Reversible-inspired save / reverse
+
+<!-- PICTURE SUGGESTION: A "before/after" diagram showing the snapshot mechanism:
+     Left side = "current state" box with ACC/BREG/SHD/RAM/RF/flags.
+     SAVE draws an arrow copying it to a "prev state" box on the right.
+     REVERSE draws a double-headed arrow swapping both boxes. -->
+
+The standout class. `SAVE` takes a **full snapshot** of every register, every RAM word, every RF entry, and all flags into `prev_*`. `REVERSE` **swaps** current and previous state, so you can bounce back and forth between two complete machine images.
+
+| func | Op | Effect |
+|---:|---|---|
+| `0x0` | SAVE | Snapshot all state into `prev_*`; sets `undo_valid` |
+| `0x1` | REVERSE | If `undo_valid`: swap current ↔ previous (full machine swap) |
+| `0x2` | ACC ↔ SHD | Swap accumulator and shadow register |
+| `0x3` | ACC ↔ BREG | Swap accumulator and B register |
+| `0x4` | CLEARUNDO | Clear `undo_valid` (discard snapshot) |
+| `0x5` | PARITY/ECC | `out_q = ecc4(ACC)` without overwriting `ACC` |
+
+Note: `func=0x5` here differs from `CLS_PERM func=0x9` — the PERM version writes the ECC result back into `ACC`; the REV version only probes it through `out_q`.
+
+---
+
+### CLS_RFALU `110` — Register-file ALU
+
+Operand encoding: `A[3:2]` = `rs`, `A[1:0]` = `rt`, `B[3:2]` = `rd`
+
+`RF[rd] = RF[rs] op RF[rt]`
+
+| func | Op |
+|---:|---|
+| `0x0` | ADD |
+| `0x1` | XOR |
+| `0x2` | AND |
+| `0x3` | OR |
+| `0x4` | SUB |
+| `0x5` | XNOR |
+| `0x6` | NAND |
+| `0x7` | NOR |
+
+Does not modify `ACC`.
+
+---
+
+### CLS_RFIO `111` — Register-file utilities
+
+| func | Op | Effect |
+|---:|---|---|
+| `0x0` | RFLOADI | `RF[A[1:0]] = B` |
+| `0x1` | RFREAD | `out_q = RF[A[1:0]]` |
+| `0x2` | RFTOACC | `ACC = RF[A[1:0]]` |
+| `0x3` | ACCTORF | `RF[A[1:0]] = ACC` |
+| `0x4` | RFMOVE | `RF[dst] = RF[src]`, `A[3:2]`=src, `A[1:0]`=dst |
+| `0x5` | RFSWAP | `RF[A[3:2]] ↔ RF[A[1:0]]` |
+| `0x6` | RFTOBREG | `BREG = RF[A[1:0]]` |
+| `0x7` | BREGTORF | `RF[A[1:0]] = BREG` |
+
+---
+
+## 7. Worked examples
+
+### Load 6 into ACC, then add 3
+
+```
+Phase 00: ui_in = {CLS_SYS, 0, 0x0}   → LOADIMM
+Phase 01: ui_in = {SYS_ACC, 0x6}
+Phase 11: uo_out → data = 0x6, Z=0, C=0
+
+Phase 00: ui_in = {CLS_ALU, 0, 0x0}   → ADD immediate
+Phase 01: ui_in = {0x0, 0x3}           → A=0 (unused), B=3
+Phase 11: uo_out → data = 0x9, Z=0, C=0
+```
+
+### Save state, mutate, then reverse
+
+```
+1. SYS LOADIMM ACC = 4
+2. SYS LOADIMM BREG = A
+3. REV ACC ↔ BREG         → ACC becomes A, BREG becomes 4; state snapshot saved
+4. REV REVERSE             → full machine swap: ACC returns to 4, BREG returns to A
+```
+
+---
+
+## 8. Testing
+
+### Run RTL simulation
+
+```bash
+cd test
+make -B
+```
+
+### Run gate-level simulation
+
+```bash
+make -B GATES=yes
+```
+
+Waveforms are written to `tb.fst`. View with GTKWave (`gtkwave tb.fst tb.gtkw`) or Surfer (`surfer tb.fst`).
+
+### What the current testbench covers
+
+The `test/test.py` cocotb suite exercises: reset behavior, SYS LOADIMM, ALU ADD/SUB/XOR, PERM SHL/BITREV, CMP compare, MEM RAM write/read, system-space read via MEM mode=1, REV ACC↔BREG, REV REVERSE, and REV parity/ECC.
+
+### What is not yet covered
+
+All RFALU and RFIO opcodes, full ALU opcode sweep, CMP MIN/MAX/POPCOUNT, MEM LOADACC/SWAPACC, REV ACC↔SHD / SAVE / CLEARUNDO, flag persistence across multiple instructions, and corner cases around carry-borrow behavior.
+
+---
+
+## 9. Known issues and gotchas
+
+- `N` flag is **not exported on `uo_out`** — read it through `SYS_FLAGS` via `CLS_MEM mode=1`.
+- `CLS_SYS` only decodes `func[1:0]` — function codes `0x0` through `0xF` collapse into four actual operations.
+- `CLS_REV func=0x1` (REVERSE) is a **swap**, not a restore. Issuing it twice returns you to the original state.
+- Two helper tasks (`flags_from_result`, `clear_all_current`) exist in the RTL but are not called by any live instruction path — scaffolding for future extensions.
+
+
+
 # tt_um_kazan_rqpu
 
 ## 4-bit externally driven execution core with reversible-undo support
