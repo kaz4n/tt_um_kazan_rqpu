@@ -47,7 +47,9 @@ The GitHub action will automatically build the ASIC files using [LibreLane](http
 
 
 
-
+![Instruction 1]instructionWaveform1.png
+![Instruction 2]docs/instructionWaveform2.png
+![GDS File]docs/gdsFilePicture.png
 
 
 # tt_um_kazan_rqpu
