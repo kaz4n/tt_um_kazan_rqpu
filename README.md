@@ -125,7 +125,7 @@ For more detail, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ---
 
-# ARCHITECTURE.md (Detailed Reference)
+# ARCHITECTURE:
 
 ## 1. Tiny Tapeout interface
 
@@ -447,6 +447,8 @@ All RFALU and RFIO opcodes, full ALU opcode sweep, CMP MIN/MAX/POPCOUNT, MEM LOA
 
 
 
+
+#Detailed Version of the READM.md
 # tt_um_kazan_rqpu
 
 ## 4-bit externally driven execution core with reversible-undo support
