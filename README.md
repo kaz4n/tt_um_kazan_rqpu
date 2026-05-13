@@ -1114,14 +1114,7 @@ These do not appear to be called by the live instruction paths. They look like s
 
 If this design is going to evolve, the most valuable improvements would be:
 
-1. add complete opcode-level tests
-2. add a self-checking table of instruction encodings in the repository
-3. expose `N` externally or define a more explicit status-read convention
-4. clarify the intended meaning of `RQPU` in the docs if that name has a project-specific expansion
-5. decide whether the project’s main message is:
-   - reversible computing inspiration, or
-   - general-purpose tiny execution engine
-6. if strict reversible computing is a goal, isolate a smaller fully reversible subset and document it separately
+1. add a self-checking table of instruction encodings in the repository
 
 ---
 
